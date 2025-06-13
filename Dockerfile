@@ -31,10 +31,10 @@ RUN rm -rf dist/* && python -m build
 RUN ls -1 dist/*.whl | head -1
 
 # Install the package
-RUN pip install dist/*.whl
+#RUN pip install dist/*.whl
 
 # install dependencies as wheels
-RUN pip wheel --no-cache-dir --wheel-dir=/wheels/ -r requirements.txt
+RUN pip wheel --no-cache-dir --wheel-dir=/wheels/ -r requirements.txt  --index-url https://pypi.tuna.tsinghua.edu.cn/simple
 
 # ensure pyjwt is used, not jwt
 RUN pip uninstall jwt -y

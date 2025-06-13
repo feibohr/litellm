@@ -101,14 +101,17 @@ class AsyncHTTPHandler:
         concurrent_limit=1000,
         client_alias: Optional[str] = None,  # name for client in logs
         ssl_verify: Optional[VerifyTypes] = None,
+        proxies: Optional[Dict[str, str]] = None,
     ):
         self.timeout = timeout
         self.event_hooks = event_hooks
+        self.proxies = proxies
         self.client = self.create_client(
             timeout=timeout,
             concurrent_limit=concurrent_limit,
             event_hooks=event_hooks,
             ssl_verify=ssl_verify,
+            proxies=proxies,
         )
         self.client_alias = client_alias
 
@@ -118,6 +121,7 @@ class AsyncHTTPHandler:
         concurrent_limit: int,
         event_hooks: Optional[Mapping[str, List[Callable[..., Any]]]],
         ssl_verify: Optional[VerifyTypes] = None,
+        proxies: Optional[Dict[str, str]] = None,
     ) -> httpx.AsyncClient:
         # SSL certificates (a.k.a CA bundle) used to verify the identity of requested hosts.
         # /path/to/certificate.pem
@@ -167,6 +171,7 @@ class AsyncHTTPHandler:
             verify=ssl_verify,
             cert=cert,
             headers=headers,
+            proxies=proxies,
         )
 
     async def close(self):
@@ -234,7 +239,7 @@ class AsyncHTTPHandler:
         except (httpx.RemoteProtocolError, httpx.ConnectError):
             # Retry the request with a new session if there is a connection error
             new_client = self.create_client(
-                timeout=timeout, concurrent_limit=1, event_hooks=self.event_hooks
+                timeout=timeout, concurrent_limit=1, event_hooks=self.event_hooks, proxies=self.proxies
             )
             try:
                 return await self.single_connection_post_request(
@@ -300,7 +305,7 @@ class AsyncHTTPHandler:
         except (httpx.RemoteProtocolError, httpx.ConnectError):
             # Retry the request with a new session if there is a connection error
             new_client = self.create_client(
-                timeout=timeout, concurrent_limit=1, event_hooks=self.event_hooks
+                timeout=timeout, concurrent_limit=1, event_hooks=self.event_hooks, proxies=self.proxies
             )
             try:
                 return await self.single_connection_post_request(
@@ -360,7 +365,7 @@ class AsyncHTTPHandler:
         except (httpx.RemoteProtocolError, httpx.ConnectError):
             # Retry the request with a new session if there is a connection error
             new_client = self.create_client(
-                timeout=timeout, concurrent_limit=1, event_hooks=self.event_hooks
+                timeout=timeout, concurrent_limit=1, event_hooks=self.event_hooks, proxies=self.proxies
             )
             try:
                 return await self.single_connection_post_request(
@@ -419,7 +424,7 @@ class AsyncHTTPHandler:
         except (httpx.RemoteProtocolError, httpx.ConnectError):
             # Retry the request with a new session if there is a connection error
             new_client = self.create_client(
-                timeout=timeout, concurrent_limit=1, event_hooks=self.event_hooks
+                timeout=timeout, concurrent_limit=1, event_hooks=self.event_hooks, proxies=self.proxies
             )
             try:
                 return await self.single_connection_post_request(
@@ -583,6 +588,7 @@ class HTTPHandler:
         concurrent_limit=1000,
         client: Optional[httpx.Client] = None,
         ssl_verify: Optional[Union[bool, str]] = None,
+        proxies: Optional[Dict[str, str]] = None,
     ):
         if timeout is None:
             timeout = _DEFAULT_TIMEOUT
@@ -611,6 +617,7 @@ class HTTPHandler:
                 verify=ssl_verify,
                 cert=cert,
                 headers=headers,
+                proxies=proxies,
             )
         else:
             self.client = client
@@ -642,7 +649,7 @@ class HTTPHandler:
     @staticmethod
     def extract_query_params(url: str) -> Dict[str, str]:
         """
-        Parse a URL’s query-string into a dict.
+        Parse a URL's query-string into a dict.
 
         :param url: full URL, e.g. "https://.../path?foo=1&bar=2"
         :return: {"foo": "1", "bar": "2"}
@@ -843,6 +850,7 @@ class HTTPHandler:
 def get_async_httpx_client(
     llm_provider: Union[LlmProviders, httpxSpecialProvider],
     params: Optional[dict] = None,
+    custom_llm_provider: Optional[str] = None,
 ) -> AsyncHTTPHandler:
     """
     Retrieves the async HTTP client from the cache
@@ -863,12 +871,36 @@ def get_async_httpx_client(
     if _cached_client:
         return _cached_client
 
+    # Get proxy configuration from global proxy config (with error handling)
+    proxy_config = None
+    try:
+        from litellm.proxy.proxy_config import global_proxy_config
+        proxy_config = global_proxy_config.get_httpx_proxy_config(custom_llm_provider=custom_llm_provider)
+    except (ImportError, AttributeError, Exception) as e:
+        # If proxy config is not available, continue without proxy
+        verbose_logger.debug(f"Proxy config not available: {e}")
+        proxy_config = None
+    
+    # 🔍 添加代理配置日志打印
+    if proxy_config:
+        verbose_logger.info(f"🌐 [PROXY] Creating Async HTTP client for {custom_llm_provider or llm_provider} with proxy config: {proxy_config}")
+        print(f"🌐 [PROXY] Async HTTP Client | Provider: {custom_llm_provider or llm_provider} | Proxy Config: {proxy_config}")
+    else:
+        verbose_logger.debug(f"🌐 [PROXY] Creating Async HTTP client for {custom_llm_provider or llm_provider} without proxy")
+        print(f"🌐 [PROXY] Async HTTP Client | Provider: {custom_llm_provider or llm_provider} | No proxy configured")
+
     if params is not None:
+        # Add proxy config to params if available
+        if proxy_config:
+            params = params.copy()  # Don't modify original params
+            params['proxies'] = proxy_config
         _new_client = AsyncHTTPHandler(**params)
     else:
-        _new_client = AsyncHTTPHandler(
-            timeout=httpx.Timeout(timeout=600.0, connect=5.0)
-        )
+        # Create params dict with proxy config if available
+        client_params = {"timeout": httpx.Timeout(timeout=600.0, connect=5.0)}
+        if proxy_config:
+            client_params['proxies'] = proxy_config
+        _new_client = AsyncHTTPHandler(**client_params)
 
     litellm.in_memory_llm_clients_cache.set_cache(
         key=_cache_key_name,
@@ -878,7 +910,7 @@ def get_async_httpx_client(
     return _new_client
 
 
-def _get_httpx_client(params: Optional[dict] = None) -> HTTPHandler:
+def _get_httpx_client(params: Optional[dict] = None, custom_llm_provider: Optional[str] = None) -> HTTPHandler:
     """
     Retrieves the HTTP client from the cache
     If not present, creates a new client
@@ -899,10 +931,36 @@ def _get_httpx_client(params: Optional[dict] = None) -> HTTPHandler:
     if _cached_client:
         return _cached_client
 
+    # Get proxy configuration from global proxy config (with error handling)
+    proxy_config = None
+    try:
+        from litellm.proxy.proxy_config import global_proxy_config
+        proxy_config = global_proxy_config.get_httpx_proxy_config(custom_llm_provider=custom_llm_provider)
+    except (ImportError, AttributeError, Exception) as e:
+        # If proxy config is not available, continue without proxy
+        verbose_logger.debug(f"Proxy config not available: {e}")
+        proxy_config = None
+    
+    # 🔍 添加代理配置日志打印
+    if proxy_config:
+        verbose_logger.info(f"🌐 [PROXY] Creating HTTP client for {custom_llm_provider or 'unknown'} with proxy config: {proxy_config}")
+        print(f"🌐 [PROXY] HTTP Client | Provider: {custom_llm_provider or 'unknown'} | Proxy Config: {proxy_config}")
+    else:
+        verbose_logger.debug(f"🌐 [PROXY] Creating HTTP client for {custom_llm_provider or 'unknown'} without proxy")
+        print(f"🌐 [PROXY] HTTP Client | Provider: {custom_llm_provider or 'unknown'} | No proxy configured")
+
     if params is not None:
+        # Add proxy config to params if available
+        if proxy_config:
+            params = params.copy()  # Don't modify original params
+            params['proxies'] = proxy_config
         _new_client = HTTPHandler(**params)
     else:
-        _new_client = HTTPHandler(timeout=httpx.Timeout(timeout=600.0, connect=5.0))
+        # Create params dict with proxy config if available
+        client_params = {"timeout": httpx.Timeout(timeout=600.0, connect=5.0)}
+        if proxy_config:
+            client_params['proxies'] = proxy_config
+        _new_client = HTTPHandler(**client_params)
 
     litellm.in_memory_llm_clients_cache.set_cache(
         key=_cache_key_name,

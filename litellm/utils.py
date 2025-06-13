@@ -4951,11 +4951,11 @@ def validate_environment(  # noqa: PLR0915
 ) -> dict:
     """
     Checks if the environment variables are valid for the given model.
-
+    
     Args:
         model (Optional[str]): The name of the model. Defaults to None.
         api_key (Optional[str]): If the user passed in an api key, of their own.
-
+        
     Returns:
         dict: A dictionary containing the following keys:
             - keys_in_environment (bool): True if all the required keys are present in the environment, False otherwise.

@@ -203,6 +203,10 @@ class GenericLiteLLMParams(CredentialLiteLLMParams, CustomPricingLiteLLMParams):
     budget_duration: Optional[str] = None
     use_in_pass_through: Optional[bool] = False
     use_litellm_proxy: Optional[bool] = False
+    
+    # Proxy configuration for this specific model/deployment
+    proxy_config: Optional[Dict[str, Any]] = None
+    
     model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
     merge_reasoning_content_in_choices: Optional[bool] = False
     model_info: Optional[Dict] = None
@@ -250,6 +254,8 @@ class GenericLiteLLMParams(CredentialLiteLLMParams, CustomPricingLiteLLMParams):
         # This will merge the reasoning content in the choices
         merge_reasoning_content_in_choices: Optional[bool] = False,
         model_info: Optional[Dict] = None,
+        # Proxy configuration for this specific model/deployment
+        proxy_config: Optional[Dict[str, Any]] = None,
         **params,
     ):
         args = locals()
@@ -318,6 +324,8 @@ class LiteLLM_Params(GenericLiteLLMParams):
         # will use deployment on pass-through endpoints if True
         use_in_pass_through: Optional[bool] = False,
         use_litellm_proxy: Optional[bool] = False,
+        # Proxy configuration for this specific model/deployment
+        proxy_config: Optional[Dict[str, Any]] = None,
         **params,
     ):
         args = locals()
@@ -405,6 +413,9 @@ class LiteLLMParamsTypedDict(TypedDict, total=False):
     # deployment budgets
     max_budget: Optional[float]
     budget_duration: Optional[str]
+    
+    # Proxy configuration for this specific model/deployment
+    proxy_config: Optional[Dict[str, Any]]
 
 
 class DeploymentTypedDict(TypedDict, total=False):

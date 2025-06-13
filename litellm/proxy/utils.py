@@ -86,6 +86,9 @@ from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup
 from litellm.secret_managers.main import str_to_bool
 from litellm.types.integrations.slack_alerting import DEFAULT_ALERT_TYPES
 from litellm.types.utils import CallTypes, LLMResponseTypes, LoggedLiteLLMParams
+from litellm.proxy.proxy_config import global_proxy_config
+from litellm.types.router import LiteLLM_Params
+import httpx
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Span as _Span
@@ -2998,3 +3001,119 @@ def get_server_root_path() -> str:
     - Otherwise, default to "/".
     """
     return os.getenv("SERVER_ROOT_PATH", "/")
+
+
+def setup_client_with_proxy(
+    litellm_params: Optional[LiteLLM_Params] = None,
+    custom_llm_provider: Optional[str] = None,
+    existing_client: Optional[httpx.Client] = None,
+    **client_kwargs
+) -> httpx.Client:
+    """
+    Create or update an httpx client with proxy configuration
+    
+    Args:
+        litellm_params: LiteLLM parameters containing model-level proxy config
+        custom_llm_provider: Provider name for provider-specific proxy config  
+        existing_client: Existing httpx client to update (optional)
+        **client_kwargs: Additional kwargs for httpx.Client
+        
+    Returns:
+        httpx.Client configured with appropriate proxy settings
+    """
+    # Get proxy configuration using the priority system
+    proxy_config = global_proxy_config.get_httpx_proxy_config(
+        litellm_params=litellm_params,
+        custom_llm_provider=custom_llm_provider
+    )
+    
+    # 🔍 添加代理配置日志打印
+    if proxy_config:
+        verbose_proxy_logger.info(f"🌐 [PROXY] Using proxy for provider '{custom_llm_provider}': {proxy_config}")
+        print_verbose(f"🌐 [PROXY] Provider: {custom_llm_provider} | Proxy Config: {proxy_config}")
+    else:
+        verbose_proxy_logger.debug(f"🌐 [PROXY] No proxy configured for provider '{custom_llm_provider}'")
+        print_verbose(f"🌐 [PROXY] Provider: {custom_llm_provider} | No proxy configured")
+    
+    # Update client_kwargs with proxy config if present
+    if proxy_config:
+        client_kwargs['proxies'] = proxy_config
+        
+    # Create new client or update existing one
+    if existing_client is None:
+        return httpx.Client(**client_kwargs)
+    else:
+        # Update existing client's proxy configuration
+        existing_client.proxies = proxy_config or {}
+        return existing_client
+
+async def setup_async_client_with_proxy(
+    litellm_params: Optional[LiteLLM_Params] = None,
+    custom_llm_provider: Optional[str] = None,
+    existing_client: Optional[httpx.AsyncClient] = None,
+    **client_kwargs
+) -> httpx.AsyncClient:
+    """
+    Create or update an async httpx client with proxy configuration
+    
+    Args:
+        litellm_params: LiteLLM parameters containing model-level proxy config
+        custom_llm_provider: Provider name for provider-specific proxy config
+        existing_client: Existing async httpx client to update (optional)
+        **client_kwargs: Additional kwargs for httpx.AsyncClient
+        
+    Returns:
+        httpx.AsyncClient configured with appropriate proxy settings
+    """
+    # Get proxy configuration using the priority system
+    proxy_config = global_proxy_config.get_httpx_proxy_config(
+        litellm_params=litellm_params,
+        custom_llm_provider=custom_llm_provider
+    )
+    
+    # 🔍 添加代理配置日志打印
+    if proxy_config:
+        verbose_proxy_logger.info(f"🌐 [PROXY] Using async proxy for provider '{custom_llm_provider}': {proxy_config}")
+        print_verbose(f"🌐 [PROXY] Async Provider: {custom_llm_provider} | Proxy Config: {proxy_config}")
+    else:
+        verbose_proxy_logger.debug(f"🌐 [PROXY] No async proxy configured for provider '{custom_llm_provider}'")
+        print_verbose(f"🌐 [PROXY] Async Provider: {custom_llm_provider} | No proxy configured")
+    
+    # Update client_kwargs with proxy config if present
+    if proxy_config:
+        client_kwargs['proxies'] = proxy_config
+        
+    # Create new client or update existing one
+    if existing_client is None:
+        return httpx.AsyncClient(**client_kwargs)
+    else:
+        # Update existing client's proxy configuration
+        existing_client.proxies = proxy_config or {}
+        return existing_client
+
+async def initialize_proxy_config_from_db(prisma_client) -> None:
+    """
+    Initialize proxy configuration from database on startup
+    
+    Args:
+        prisma_client: Prisma client instance
+    """
+    await global_proxy_config.load_provider_proxy_config_from_db(prisma_client)
+
+async def update_provider_proxy_config(
+    provider_config: Dict[str, Any], 
+    prisma_client=None
+) -> None:
+    """
+    Update provider-level proxy configuration
+    
+    Args:
+        provider_config: New provider proxy configuration
+        prisma_client: Optional prisma client for database persistence
+    """
+    global_proxy_config.set_provider_proxy_config(provider_config)
+    
+    if prisma_client:
+        await global_proxy_config.update_provider_proxy_config_in_db(
+            prisma_client, provider_config
+        )

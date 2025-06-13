@@ -219,6 +219,7 @@ class BaseLLMHTTPHandler:
             async_httpx_client = get_async_httpx_client(
                 llm_provider=litellm.LlmProviders(custom_llm_provider),
                 params={"ssl_verify": litellm_params.get("ssl_verify", None)},
+                custom_llm_provider=custom_llm_provider,
             )
         else:
             async_httpx_client = client
@@ -446,7 +447,8 @@ class BaseLLMHTTPHandler:
 
         if client is None or not isinstance(client, HTTPHandler):
             sync_httpx_client = _get_httpx_client(
-                params={"ssl_verify": litellm_params.get("ssl_verify", None)}
+                params={"ssl_verify": litellm_params.get("ssl_verify", None)},
+                custom_llm_provider=custom_llm_provider,
             )
         else:
             sync_httpx_client = client
@@ -496,9 +498,8 @@ class BaseLLMHTTPHandler:
     ) -> Tuple[Any, dict]:
         if client is None or not isinstance(client, HTTPHandler):
             sync_httpx_client = _get_httpx_client(
-                {
-                    "ssl_verify": litellm_params.get("ssl_verify", None),
-                }
+                params={"ssl_verify": litellm_params.get("ssl_verify", None)},
+                custom_llm_provider=litellm_params.get("custom_llm_provider"),
             )
         else:
             sync_httpx_client = client
@@ -637,6 +638,7 @@ class BaseLLMHTTPHandler:
             async_httpx_client = get_async_httpx_client(
                 llm_provider=litellm.LlmProviders(custom_llm_provider),
                 params={"ssl_verify": litellm_params.get("ssl_verify", None)},
+                custom_llm_provider=custom_llm_provider,
             )
         else:
             async_httpx_client = client
@@ -784,7 +786,10 @@ class BaseLLMHTTPHandler:
             )
 
         if client is None or not isinstance(client, HTTPHandler):
-            sync_httpx_client = _get_httpx_client()
+            sync_httpx_client = _get_httpx_client(
+                params={"ssl_verify": litellm_params.get("ssl_verify", None)},
+                custom_llm_provider=custom_llm_provider,
+            )
         else:
             sync_httpx_client = client
 
@@ -916,7 +921,10 @@ class BaseLLMHTTPHandler:
             )
 
         if client is None or not isinstance(client, HTTPHandler):
-            sync_httpx_client = _get_httpx_client()
+            sync_httpx_client = _get_httpx_client(
+                params={"ssl_verify": litellm_params.get("ssl_verify", None)},
+                custom_llm_provider=custom_llm_provider,
+            )
         else:
             sync_httpx_client = client
 
@@ -958,7 +966,8 @@ class BaseLLMHTTPHandler:
     ) -> RerankResponse:
         if client is None or not isinstance(client, AsyncHTTPHandler):
             async_httpx_client = get_async_httpx_client(
-                llm_provider=litellm.LlmProviders(custom_llm_provider)
+                llm_provider=litellm.LlmProviders(custom_llm_provider),
+                params={"ssl_verify": litellm_params.get("ssl_verify", None)},
             )
         else:
             async_httpx_client = client
@@ -1013,7 +1022,10 @@ class BaseLLMHTTPHandler:
         )
 
         if client is None or not isinstance(client, HTTPHandler):
-            client = _get_httpx_client()
+            client = _get_httpx_client(
+                params={"ssl_verify": litellm_params.get("ssl_verify", None)},
+                custom_llm_provider=custom_llm_provider,
+            )
 
         complete_url = provider_config.get_complete_url(
             api_base=api_base,
@@ -1081,7 +1093,9 @@ class BaseLLMHTTPHandler:
     ) -> Union[AnthropicMessagesResponse, AsyncIterator]:
         if client is None or not isinstance(client, AsyncHTTPHandler):
             async_httpx_client = get_async_httpx_client(
-                llm_provider=litellm.LlmProviders.ANTHROPIC
+                llm_provider=litellm.LlmProviders.ANTHROPIC,
+                params={"ssl_verify": litellm_params.get("ssl_verify", None)},
+                custom_llm_provider=custom_llm_provider,
             )
         else:
             async_httpx_client = client
@@ -1280,7 +1294,8 @@ class BaseLLMHTTPHandler:
 
         if client is None or not isinstance(client, HTTPHandler):
             sync_httpx_client = _get_httpx_client(
-                params={"ssl_verify": litellm_params.get("ssl_verify", None)}
+                params={"ssl_verify": litellm_params.get("ssl_verify", None)},
+                custom_llm_provider=custom_llm_provider,
             )
         else:
             sync_httpx_client = client
@@ -1401,6 +1416,7 @@ class BaseLLMHTTPHandler:
             async_httpx_client = get_async_httpx_client(
                 llm_provider=litellm.LlmProviders(custom_llm_provider),
                 params={"ssl_verify": litellm_params.get("ssl_verify", None)},
+                custom_llm_provider=custom_llm_provider,
             )
         else:
             async_httpx_client = client
@@ -1605,7 +1621,8 @@ class BaseLLMHTTPHandler:
             )
         if client is None or not isinstance(client, HTTPHandler):
             sync_httpx_client = _get_httpx_client(
-                params={"ssl_verify": litellm_params.get("ssl_verify", None)}
+                params={"ssl_verify": litellm_params.get("ssl_verify", None)},
+                custom_llm_provider=custom_llm_provider,
             )
         else:
             sync_httpx_client = client
@@ -1690,7 +1707,8 @@ class BaseLLMHTTPHandler:
 
         if client is None or not isinstance(client, HTTPHandler):
             sync_httpx_client = _get_httpx_client(
-                params={"ssl_verify": litellm_params.get("ssl_verify", None)}
+                params={"ssl_verify": litellm_params.get("ssl_verify", None)},
+                custom_llm_provider=custom_llm_provider,
             )
         else:
             sync_httpx_client = client
@@ -1870,7 +1888,10 @@ class BaseLLMHTTPHandler:
             )
 
         if client is None or not isinstance(client, HTTPHandler):
-            sync_httpx_client = _get_httpx_client()
+            sync_httpx_client = _get_httpx_client(
+                params={"ssl_verify": litellm_params.get("ssl_verify", None)},
+                custom_llm_provider=custom_llm_provider,
+            )
         else:
             sync_httpx_client = client
 
@@ -2161,7 +2182,8 @@ class BaseLLMHTTPHandler:
 
         if client is None or not isinstance(client, HTTPHandler):
             sync_httpx_client = _get_httpx_client(
-                params={"ssl_verify": litellm_params.get("ssl_verify", None)}
+                params={"ssl_verify": litellm_params.get("ssl_verify", None)},
+                custom_llm_provider=custom_llm_provider,
             )
         else:
             sync_httpx_client = client

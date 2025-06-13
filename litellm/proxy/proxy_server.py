@@ -618,6 +618,11 @@ async def proxy_startup_event(app: FastAPI):
     ## [Optional] Initialize dd tracer
     ProxyStartupEvent._init_dd_tracer()
 
+    # Initialize proxy configuration system 
+    from litellm.proxy.utils import initialize_proxy_config_from_db
+    if prisma_client is not None:
+        await initialize_proxy_config_from_db(prisma_client)
+
     # End of startup event
     yield
 
@@ -1629,6 +1634,11 @@ class ProxyConfig:
                 _license_check.license_str = os.getenv("LITELLM_LICENSE", None)
                 premium_user = _license_check.is_premium()
 
+        # Initialize proxy configuration system 
+        from litellm.proxy.utils import initialize_proxy_config_from_db
+        if prisma_client is not None:
+            await initialize_proxy_config_from_db(prisma_client)
+
         ## Callback settings
         callback_settings = config.get("callback_settings", None)
 
@@ -2050,7 +2060,7 @@ class ProxyConfig:
             assistants_config=assistants_config,
             router_general_settings=RouterGeneralSettings(
                 async_only_mode=True  # only init async clients
-            ),
+            ), 
             ignore_invalid_deployments=True,  # don't raise an error if a deployment is invalid
         )  # type:ignore
 
