@@ -10,3 +10,69 @@ tests
 *.tgz
 log.txt
 docker/Dockerfile.*
+
+# Development files
+.venv
+.idea
+.DS_Store
+*.pyc
+__pycache__
+.pytest_cache
+.coverage
+.mypy_cache
+*.egg-info
+.tox
+.env
+.env.local
+.env.*.local
+
+# Build artifacts
+dist/
+build/
+*.egg
+*.whl
+
+# OS generated files
+Thumbs.db
+.DS_Store
+*.swp
+*.swo
+*~
+
+# IDE files
+.vscode/
+.idea/
+*.sublime-*
+
+# Log files
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+
+# 🚀 优化：避免复制大文件影响Docker缓存
+node_modules/
+.npm/
+*.tar.gz
+*.zip
+
+# 开发和测试相关
+.coverage
+.pytest_cache
+.tox
+.mypy_cache
+.hypothesis
+
+# 文档和示例（不影响运行）
+examples/
+docs/
+*.md
+!README.md
+
+# 可能的大型数据文件
+data/
+logs/
+cache/

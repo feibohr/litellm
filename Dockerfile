@@ -14,11 +14,21 @@ USER root
 # Install build dependencies
 RUN apk add --no-cache gcc python3-dev openssl openssl-dev
 
-
 RUN pip install --upgrade pip && \
     pip install build
 
-# Copy the current directory contents into the container at /app
+# 🚀 关键优化：先只复制requirements.txt（利用Docker层缓存）
+COPY requirements.txt .
+
+# 安装依赖为wheels（这一步会被缓存，除非requirements.txt变化）
+RUN pip wheel --no-cache-dir --wheel-dir=/wheels/ -r requirements.txt --index-url https://pypi.tuna.tsinghua.edu.cn/simple
+
+# ensure pyjwt is used, not jwt
+RUN pip uninstall jwt -y || true
+RUN pip uninstall PyJWT -y || true
+RUN pip install PyJWT==2.9.0 --no-cache-dir
+
+# 🚀 现在才复制所有代码（代码变化不会影响上面的pip缓存）
 COPY . .
 
 # Build Admin UI
@@ -32,17 +42,6 @@ RUN ls -1 dist/*.whl | head -1
 
 # Install the package
 #RUN pip install dist/*.whl
-
-# install dependencies as wheels
-RUN pip wheel --no-cache-dir --wheel-dir=/wheels/ -r requirements.txt  --index-url https://pypi.tuna.tsinghua.edu.cn/simple
-
-# ensure pyjwt is used, not jwt
-RUN pip uninstall jwt -y
-RUN pip uninstall PyJWT -y
-RUN pip install PyJWT==2.9.0 --no-cache-dir
-
-# Build Admin UI
-RUN chmod +x docker/build_admin_ui.sh && ./docker/build_admin_ui.sh
 
 # Runtime stage
 FROM $LITELLM_RUNTIME_IMAGE AS runtime
@@ -74,5 +73,5 @@ EXPOSE 4000/tcp
 
 ENTRYPOINT ["docker/prod_entrypoint.sh"]
 
-# Append "--detailed_debug" to the end of CMD to view detailed debug logs
-CMD ["--port", "4000"]
+# 🚀 修复K8s部署问题：绑定到0.0.0.0而不是127.0.0.1
+CMD ["--port", "4000", "--host", "0.0.0.0"]
