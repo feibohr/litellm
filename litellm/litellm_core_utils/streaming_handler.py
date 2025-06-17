@@ -614,6 +614,7 @@ class CustomStreamWrapper:
         args = {
             "model": _model,
             "stream_options": self.stream_options,
+            "provider": _logging_obj_llm_provider,
             **chunk_dict,
         }
 
@@ -1390,12 +1391,67 @@ class CustomStreamWrapper:
         except StopIteration:
             raise StopIteration
         except Exception as e:
-            traceback.format_exc()
-            setattr(e, "message", str(e))
+            traceback_exception = traceback.format_exc()
+            
+            # Check if this is a stream closed error that might be retryable with multi-proxy
+            if "streamclosed" in str(e).lower() or "stream closed" in str(e).lower():
+                verbose_proxy_logger.warning(f"🔌 Stream connection closed: {e}")
+                
+                # Check if multi-proxy configuration is available
+                try:
+                    from litellm.proxy.proxy_config import global_proxy_config
+                    
+                    # Try to get multi-proxy config
+                    multi_proxy_config = None
+                    if hasattr(self, 'custom_llm_provider') and self.custom_llm_provider:
+                        try:
+                            loop = asyncio.get_event_loop()
+                            multi_proxy_config = loop.run_until_complete(
+                                global_proxy_config.get_multi_proxy_config_dynamic(
+                                    custom_llm_provider=self.custom_llm_provider
+                                )
+                            )
+                        except Exception:
+                            pass
+                    
+                    if multi_proxy_config:
+                        verbose_proxy_logger.info(f"💡 Multi-proxy available for retry - converting to connection error")
+                        # Convert to a connection error that will be handled by the retry mechanism
+                        from litellm.exceptions import APIConnectionError
+                        raise APIConnectionError(
+                            message=f"Stream connection closed - retryable with multi-proxy: {str(e)}",
+                            llm_provider=self.custom_llm_provider,
+                            model=self.model
+                        )
+                    else:
+                        verbose_proxy_logger.debug(f"No multi-proxy config available for {self.custom_llm_provider}")
+                        
+                except ImportError:
+                    verbose_proxy_logger.debug("Multi-proxy handler not available")
+                except Exception as proxy_error:
+                    verbose_proxy_logger.debug(f"Error checking multi-proxy config: {proxy_error}")
+            
+            if self.logging_obj is not None:
+                ## LOGGING
+                threading.Thread(
+                    target=self.logging_obj.failure_handler,
+                    args=(e, traceback_exception),
+                ).start()  # log response
+                # Handle any exceptions that might occur during streaming
+                try:
+                    asyncio.create_task(
+                        self.logging_obj.async_failure_handler(e, traceback_exception)
+                    )
+                except Exception:
+                    # If async logging fails, continue without it
+                    pass
+            ## Map to OpenAI Exception
             raise exception_type(
                 model=self.model,
                 custom_llm_provider=self.custom_llm_provider,
                 original_exception=e,
+                completion_kwargs={},
+                extra_kwargs={},
             )
 
     def set_logging_event_loop(self, loop):
@@ -1528,25 +1584,28 @@ class CustomStreamWrapper:
                     )
                     # HANDLE STREAM OPTIONS
                     self.chunks.append(response)
-                    if hasattr(
-                        response, "usage"
-                    ):  # remove usage from chunk, only send on final chunk
-                        # Convert the object to a dictionary
+                    
+                    # Check if this should be the final chunk with usage
+                    should_add_usage = False
+                    if hasattr(response, "usage"):
+                        # Remove usage from intermediate chunks, but remember we had it
                         obj_dict = response.dict()
-
-                        # Remove an attribute (e.g., 'attr2')
                         if "usage" in obj_dict:
                             del obj_dict["usage"]
-
-                        # Create a new object without the removed attribute
-                        response = self.model_response_creator(
-                            chunk=obj_dict, hidden_params=response._hidden_params
-                        )
-                    # add usage as hidden param
-                    if self.sent_last_chunk is True and self.stream_options is None:
+                        response = self.model_response_creator(chunk=obj_dict)
+                    
+                    # Check if this is the final chunk (has finish_reason)
+                    if (response.choices and len(response.choices) > 0 and 
+                        response.choices[0].finish_reason is not None):
+                        should_add_usage = True
+                    
+                    # Add usage to final chunk
+                    if should_add_usage and self.send_stream_usage:
                         usage = calculate_total_usage(chunks=self.chunks)
                         response._hidden_params["usage"] = usage
-                    # RETURN RESULT
+                        response.usage = usage
+                        
+                    print_verbose(f"final returned processed chunk: {response}")
                     return response
 
         except StopIteration:
@@ -1589,9 +1648,10 @@ class CustomStreamWrapper:
             else:
                 self.sent_last_chunk = True
                 processed_chunk = self.finish_reason_handler()
-                if self.stream_options is None:  # add usage as hidden param
-                    usage = calculate_total_usage(chunks=self.chunks)
-                    processed_chunk._hidden_params["usage"] = usage
+                # Always add usage to final chunk, regardless of stream_options
+                usage = calculate_total_usage(chunks=self.chunks)
+                processed_chunk._hidden_params["usage"] = usage
+                processed_chunk.usage = usage
                 ## LOGGING
                 executor.submit(
                     self.run_success_logging_and_cache_storage,
@@ -1601,18 +1661,67 @@ class CustomStreamWrapper:
                 return processed_chunk
         except Exception as e:
             traceback_exception = traceback.format_exc()
-            # LOG FAILURE - handle streaming failure logging in the _next_ object, remove `handle_failure` once it's deprecated
-            threading.Thread(
-                target=self.logging_obj.failure_handler, args=(e, traceback_exception)
-            ).start()
-            if isinstance(e, OpenAIError):
-                raise e
-            else:
-                raise exception_type(
-                    model=self.model,
-                    original_exception=e,
-                    custom_llm_provider=self.custom_llm_provider,
-                )
+            
+            # Check if this is a stream closed error that might be retryable with multi-proxy
+            if "streamclosed" in str(e).lower() or "stream closed" in str(e).lower():
+                verbose_proxy_logger.warning(f"🔌 Stream connection closed: {e}")
+                
+                # Check if multi-proxy configuration is available
+                try:
+                    from litellm.proxy.proxy_config import global_proxy_config
+                    
+                    # Try to get multi-proxy config
+                    multi_proxy_config = None
+                    if hasattr(self, 'custom_llm_provider') and self.custom_llm_provider:
+                        try:
+                            loop = asyncio.get_event_loop()
+                            multi_proxy_config = loop.run_until_complete(
+                                global_proxy_config.get_multi_proxy_config_dynamic(
+                                    custom_llm_provider=self.custom_llm_provider
+                                )
+                            )
+                        except Exception:
+                            pass
+                    
+                    if multi_proxy_config:
+                        verbose_proxy_logger.info(f"💡 Multi-proxy available for retry - converting to connection error")
+                        # Convert to a connection error that will be handled by the retry mechanism
+                        from litellm.exceptions import APIConnectionError
+                        raise APIConnectionError(
+                            message=f"Stream connection closed - retryable with multi-proxy: {str(e)}",
+                            llm_provider=self.custom_llm_provider,
+                            model=self.model
+                        )
+                    else:
+                        verbose_proxy_logger.debug(f"No multi-proxy config available for {self.custom_llm_provider}")
+                        
+                except ImportError:
+                    verbose_proxy_logger.debug("Multi-proxy handler not available")
+                except Exception as proxy_error:
+                    verbose_proxy_logger.debug(f"Error checking multi-proxy config: {proxy_error}")
+            
+            if self.logging_obj is not None:
+                ## LOGGING
+                threading.Thread(
+                    target=self.logging_obj.failure_handler,
+                    args=(e, traceback_exception),
+                ).start()  # log response
+                # Handle any exceptions that might occur during streaming
+                try:
+                    asyncio.create_task(
+                        self.logging_obj.async_failure_handler(e, traceback_exception)
+                    )
+                except Exception:
+                    # If async logging fails, continue without it
+                    pass
+            ## Map to OpenAI Exception
+            raise exception_type(
+                model=self.model,
+                custom_llm_provider=self.custom_llm_provider,
+                original_exception=e,
+                completion_kwargs={},
+                extra_kwargs={},
+            )
 
     def fetch_sync_stream(self):
         if self.completion_stream is None and self.make_call is not None:
@@ -1683,18 +1792,27 @@ class CustomStreamWrapper:
                         input=self.response_uptil_now, model=self.model
                     )
                     self.chunks.append(processed_chunk)
-                    if hasattr(
-                        processed_chunk, "usage"
-                    ):  # remove usage from chunk, only send on final chunk
-                        # Convert the object to a dictionary
+                    
+                    # Check if this should be the final chunk with usage
+                    should_add_usage = False
+                    if hasattr(processed_chunk, "usage"):
+                        # Remove usage from intermediate chunks, but remember we had it
                         obj_dict = processed_chunk.dict()
-
-                        # Remove an attribute (e.g., 'attr2')
                         if "usage" in obj_dict:
                             del obj_dict["usage"]
-
-                        # Create a new object without the removed attribute
                         processed_chunk = self.model_response_creator(chunk=obj_dict)
+                    
+                    # Check if this is the final chunk (has finish_reason)
+                    if (processed_chunk.choices and len(processed_chunk.choices) > 0 and 
+                        processed_chunk.choices[0].finish_reason is not None):
+                        should_add_usage = True
+                    
+                    # Add usage to final chunk
+                    if should_add_usage and self.send_stream_usage:
+                        usage = calculate_total_usage(chunks=self.chunks)
+                        processed_chunk._hidden_params["usage"] = usage
+                        processed_chunk.usage = usage
+                        
                     print_verbose(f"final returned processed chunk: {processed_chunk}")
                     return processed_chunk
                 raise StopAsyncIteration
@@ -1777,6 +1895,16 @@ class CustomStreamWrapper:
             else:
                 self.sent_last_chunk = True
                 processed_chunk = self.finish_reason_handler()
+                # Always add usage to final chunk, regardless of stream_options
+                usage = calculate_total_usage(chunks=self.chunks)
+                processed_chunk._hidden_params["usage"] = usage
+                processed_chunk.usage = usage
+                ## LOGGING
+                executor.submit(
+                    self.run_success_logging_and_cache_storage,
+                    processed_chunk,
+                    cache_hit,
+                )  # log response
                 return processed_chunk
         except httpx.TimeoutException as e:  # if httpx read timeout error occues
             traceback_exception = traceback.format_exc()
@@ -1791,12 +1919,55 @@ class CustomStreamWrapper:
                     args=(e, traceback_exception),
                 ).start()  # log response
                 # Handle any exceptions that might occur during streaming
-                asyncio.create_task(
-                    self.logging_obj.async_failure_handler(e, traceback_exception)
-                )
+                try:
+                    asyncio.create_task(
+                        self.logging_obj.async_failure_handler(e, traceback_exception)
+                    )
+                except Exception:
+                    # If async logging fails, continue without it
+                    pass
             raise e
         except Exception as e:
             traceback_exception = traceback.format_exc()
+            
+            # Check if this is a stream closed error that might be retryable with multi-proxy
+            if "streamclosed" in str(e).lower() or "stream closed" in str(e).lower():
+                verbose_proxy_logger.warning(f"🔌 Stream connection closed: {e}")
+                
+                # Check if multi-proxy configuration is available
+                try:
+                    from litellm.proxy.proxy_config import global_proxy_config
+                    
+                    # Try to get multi-proxy config
+                    multi_proxy_config = None
+                    if hasattr(self, 'custom_llm_provider') and self.custom_llm_provider:
+                        try:
+                            loop = asyncio.get_event_loop()
+                            multi_proxy_config = loop.run_until_complete(
+                                global_proxy_config.get_multi_proxy_config_dynamic(
+                                    custom_llm_provider=self.custom_llm_provider
+                                )
+                            )
+                        except Exception:
+                            pass
+                    
+                    if multi_proxy_config:
+                        verbose_proxy_logger.info(f"💡 Multi-proxy available for retry - converting to connection error")
+                        # Convert to a connection error that will be handled by the retry mechanism
+                        from litellm.exceptions import APIConnectionError
+                        raise APIConnectionError(
+                            message=f"Stream connection closed - retryable with multi-proxy: {str(e)}",
+                            llm_provider=self.custom_llm_provider,
+                            model=self.model
+                        )
+                    else:
+                        verbose_proxy_logger.debug(f"No multi-proxy config available for {self.custom_llm_provider}")
+                        
+                except ImportError:
+                    verbose_proxy_logger.debug("Multi-proxy handler not available")
+                except Exception as proxy_error:
+                    verbose_proxy_logger.debug(f"Error checking multi-proxy config: {proxy_error}")
+            
             if self.logging_obj is not None:
                 ## LOGGING
                 threading.Thread(
@@ -1804,9 +1975,13 @@ class CustomStreamWrapper:
                     args=(e, traceback_exception),
                 ).start()  # log response
                 # Handle any exceptions that might occur during streaming
-                asyncio.create_task(
-                    self.logging_obj.async_failure_handler(e, traceback_exception)  # type: ignore
-                )
+                try:
+                    asyncio.create_task(
+                        self.logging_obj.async_failure_handler(e, traceback_exception)
+                    )
+                except Exception:
+                    # If async logging fails, continue without it
+                    pass
             ## Map to OpenAI Exception
             raise exception_type(
                 model=self.model,
@@ -1854,15 +2029,56 @@ class CustomStreamWrapper:
 
 
 def calculate_total_usage(chunks: List[ModelResponse]) -> Usage:
-    """Assume most recent usage chunk has total usage uptil then."""
+    """Calculate total usage from streaming chunks with fallback token counting."""
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    
+    # First, try to get usage from chunks (if provider sent it)
     for chunk in chunks:
-        if "usage" in chunk:
-            if "prompt_tokens" in chunk["usage"]:
-                prompt_tokens = chunk["usage"].get("prompt_tokens", 0) or 0
-            if "completion_tokens" in chunk["usage"]:
-                completion_tokens = chunk["usage"].get("completion_tokens", 0) or 0
+        if hasattr(chunk, 'usage') and chunk.usage is not None:
+            if chunk.usage.prompt_tokens and chunk.usage.prompt_tokens > 0:
+                prompt_tokens = chunk.usage.prompt_tokens
+            if chunk.usage.completion_tokens and chunk.usage.completion_tokens > 0:
+                completion_tokens = chunk.usage.completion_tokens
+    
+    # If no usage found in chunks, try to calculate from content
+    if prompt_tokens == 0 or completion_tokens == 0:
+        try:
+            # Try to extract content from chunks
+            combined_content = ""
+            for chunk in chunks:
+                if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
+                    choice = chunk.choices[0]
+                    if hasattr(choice, 'delta') and choice.delta and choice.delta.content:
+                        combined_content += choice.delta.content
+            
+            # Get model name from first chunk
+            model_name = getattr(chunks[0], 'model', 'gpt-3.5-turbo') if chunks else 'gpt-3.5-turbo'
+            
+            # Count completion tokens from content
+            if completion_tokens == 0 and combined_content:
+                try:
+                    import litellm
+                    completion_tokens = litellm.token_counter(
+                        model=model_name,
+                        text=combined_content,
+                        count_response_tokens=True
+                    )
+                except Exception:
+                    # Fallback: rough estimate
+                    completion_tokens = max(1, len(combined_content.split()) // 2)
+            
+            # For prompt tokens, we'd need the original messages
+            # For now, set a reasonable fallback if we got completion tokens
+            if prompt_tokens == 0 and completion_tokens > 0:
+                prompt_tokens = 1  # At least 1 token for the request
+                
+        except Exception:
+            # Ultimate fallback
+            if completion_tokens == 0:
+                completion_tokens = 1
+            if prompt_tokens == 0:
+                prompt_tokens = 1
 
     returned_usage_chunk = Usage(
         prompt_tokens=prompt_tokens,

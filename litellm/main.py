@@ -519,7 +519,8 @@ async def acompletion(
         ):  ## CACHING SCENARIO
             if isinstance(init_response, dict):
                 response = ModelResponse(**init_response)
-            response = init_response
+            else:
+                response = init_response
         elif asyncio.iscoroutine(init_response):
             response = await init_response
         else:
@@ -537,6 +538,18 @@ async def acompletion(
             response.set_logging_event_loop(
                 loop=loop
             )  # sets the logging event loop if the user does sync streaming (e.g. on proxy for sagemaker calls)
+            
+        # Add provider information to response
+        if response is not None and custom_llm_provider:
+            try:
+                if hasattr(response, 'provider'):
+                    response.provider = custom_llm_provider
+                else:
+                    setattr(response, 'provider', custom_llm_provider)
+            except AttributeError:
+                # Skip setting provider if the response object doesn't support it
+                pass
+                
         return response
     except Exception as e:
         custom_llm_provider = custom_llm_provider or "openai"
@@ -803,6 +816,17 @@ def mock_completion(
         try:
             _, custom_llm_provider, _, _ = litellm.utils.get_llm_provider(model=model)
             model_response._hidden_params["custom_llm_provider"] = custom_llm_provider
+            
+            # Add provider information to response
+            if custom_llm_provider:
+                try:
+                    if hasattr(model_response, 'provider'):
+                        model_response.provider = custom_llm_provider
+                    else:
+                        setattr(model_response, 'provider', custom_llm_provider)
+                except AttributeError:
+                    # Skip setting provider if the response object doesn't support it
+                    pass
         except Exception:
             # dont let setting a hidden param block a mock_respose
             pass
@@ -3267,6 +3291,18 @@ def completion(  # type: ignore # noqa: PLR0915
             raise LiteLLMUnknownProvider(
                 model=model, custom_llm_provider=custom_llm_provider
             )
+            
+        # Add provider information to response
+        if response is not None and custom_llm_provider:
+            try:
+                if hasattr(response, 'provider'):
+                    response.provider = custom_llm_provider
+                else:
+                    setattr(response, 'provider', custom_llm_provider)
+            except AttributeError:
+                # Skip setting provider if the response object doesn't support it
+                pass
+                
         return response
     except Exception as e:
         ## Map to OpenAI Exception

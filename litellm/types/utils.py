@@ -1098,6 +1098,8 @@ class ModelResponseBase(OpenAIObject):
 class ModelResponseStream(ModelResponseBase):
     choices: List[StreamingChoices]
     provider_specific_fields: Optional[Dict[str, Any]] = Field(default=None)
+    provider: Optional[str] = None
+    """The provider used for this completion."""
 
     def __init__(
         self,
@@ -1107,6 +1109,7 @@ class ModelResponseStream(ModelResponseBase):
         id: Optional[str] = None,
         created: Optional[int] = None,
         provider_specific_fields: Optional[Dict[str, Any]] = None,
+        provider: Optional[str] = None,
         **kwargs,
     ):
         if choices is not None and isinstance(choices, list):
@@ -1144,6 +1147,9 @@ class ModelResponseStream(ModelResponseBase):
         kwargs["created"] = created
         kwargs["object"] = "chat.completion.chunk"
         kwargs["provider_specific_fields"] = provider_specific_fields
+        
+        if provider is not None:
+            kwargs["provider"] = provider
 
         super().__init__(**kwargs)
 
@@ -1170,6 +1176,9 @@ class ModelResponseStream(ModelResponseBase):
 class ModelResponse(ModelResponseBase):
     choices: List[Union[Choices, StreamingChoices]]
     """The list of completion choices the model generated for the input prompt."""
+    
+    provider: Optional[str] = None
+    """The provider used for this completion."""
 
     def __init__(
         self,
@@ -1185,6 +1194,7 @@ class ModelResponse(ModelResponseBase):
         response_ms=None,
         hidden_params=None,
         _response_headers=None,
+        provider=None,
         **params,
     ) -> None:
         if stream is not None and stream is True:
@@ -1251,6 +1261,9 @@ class ModelResponse(ModelResponseBase):
 
         if usage is not None:
             init_values["usage"] = usage
+            
+        if provider is not None:
+            init_values["provider"] = provider
 
         super().__init__(
             **init_values,

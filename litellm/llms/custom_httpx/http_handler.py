@@ -10,7 +10,7 @@ from httpx import USE_CLIENT_DEFAULT, AsyncHTTPTransport, HTTPTransport
 from httpx._types import RequestFiles
 
 import litellm
-from litellm._logging import verbose_logger
+from litellm._logging import verbose_logger, verbose_proxy_logger
 from litellm.constants import _DEFAULT_TTL_FOR_HTTPX_CLIENTS
 from litellm.litellm_core_utils.logging_utils import track_llm_api_timing
 from litellm.types.llms.custom_http import *
@@ -858,6 +858,8 @@ def get_async_httpx_client(
 
     Caches the new client and returns it.
     """
+    verbose_proxy_logger.debug(f"🌐 Creating async HTTP client for {custom_llm_provider or llm_provider}")
+    
     _params_key_name = ""
     if params is not None:
         for key, value in params.items():
@@ -871,43 +873,79 @@ def get_async_httpx_client(
     if _cached_client:
         return _cached_client
 
+    # Check for multi-proxy configuration first
+    multi_proxy_config = None
+    try:
+        from litellm.proxy.proxy_config import global_proxy_config
+        if custom_llm_provider:
+            multi_proxy_config = global_proxy_config.get_multi_proxy_config(
+                custom_llm_provider=custom_llm_provider
+            )
+    except Exception as e:
+        verbose_logger.debug(f"Could not check multi-proxy config: {e}")
+        
     # Get proxy configuration from global proxy config (with error handling)
     proxy_config = None
     try:
         from litellm.proxy.proxy_config import global_proxy_config
-        proxy_config = global_proxy_config.get_httpx_proxy_config(custom_llm_provider=custom_llm_provider)
+        if multi_proxy_config:
+            verbose_proxy_logger.info(
+                f"🔄 Multi-proxy configuration detected for {custom_llm_provider}, "
+                f"will use dynamic proxy selection"
+            )
+            # For multi-proxy, get the next available proxy
+            proxy_config = global_proxy_config.get_next_available_proxy(
+                custom_llm_provider=custom_llm_provider
+            )
+            if proxy_config:
+                # Convert to httpx format
+                httpx_proxy_config = {}
+                if proxy_config.get('http'):
+                    httpx_proxy_config['http://'] = proxy_config['http']
+                if proxy_config.get('https'):
+                    httpx_proxy_config['https://'] = proxy_config['https']
+                proxy_config = httpx_proxy_config
+        else:
+            # Use regular proxy configuration
+            proxy_config = global_proxy_config.get_httpx_proxy_config(custom_llm_provider=custom_llm_provider)
     except (ImportError, AttributeError, Exception) as e:
         # If proxy config is not available, continue without proxy
         verbose_logger.debug(f"Proxy config not available: {e}")
         proxy_config = None
-    
+        
     # 🔍 添加代理配置日志打印
     if proxy_config:
-        verbose_logger.info(f"🌐 [PROXY] Creating Async HTTP client for {custom_llm_provider or llm_provider} with proxy config: {proxy_config}")
-        print(f"🌐 [PROXY] Async HTTP Client | Provider: {custom_llm_provider or llm_provider} | Proxy Config: {proxy_config}")
+        proxy_type = "MULTI-PROXY" if multi_proxy_config else "PROXY"
+        verbose_proxy_logger.info(f"🌐 [{proxy_type}] Creating Async HTTP client for {custom_llm_provider or llm_provider} with proxy config: {proxy_config}")
+        print(f"🌐 [{proxy_type}] Async HTTP Client | Provider: {custom_llm_provider or llm_provider} | Proxy Config: {proxy_config}")
     else:
-        verbose_logger.debug(f"🌐 [PROXY] Creating Async HTTP client for {custom_llm_provider or llm_provider} without proxy")
+        verbose_proxy_logger.debug(f"🌐 [PROXY] Creating Async HTTP client for {custom_llm_provider or llm_provider} without proxy")
         print(f"🌐 [PROXY] Async HTTP Client | Provider: {custom_llm_provider or llm_provider} | No proxy configured")
 
+    # Create params dict with proxy config if available
+    client_params = {}
     if params is not None:
-        # Add proxy config to params if available
-        if proxy_config:
-            params = params.copy()  # Don't modify original params
-            params['proxies'] = proxy_config
-        _new_client = AsyncHTTPHandler(**params)
-    else:
-        # Create params dict with proxy config if available
-        client_params = {"timeout": httpx.Timeout(timeout=600.0, connect=5.0)}
-        if proxy_config:
-            client_params['proxies'] = proxy_config
-        _new_client = AsyncHTTPHandler(**client_params)
+        client_params.update(params)
+    
+    # Add proxy config to params if available
+    if proxy_config:
+        client_params['proxies'] = proxy_config
 
-    litellm.in_memory_llm_clients_cache.set_cache(
-        key=_cache_key_name,
-        value=_new_client,
-        ttl=_DEFAULT_TTL_FOR_HTTPX_CLIENTS,
+    # Create params dict with proxy config if available
+    httpx_client_params = {}
+    if proxy_config:
+        httpx_client_params['proxies'] = proxy_config
+
+    # Default timeout and concurrent limit
+    timeout = httpx.Timeout(
+        timeout=600.0, read=600.0, write=600.0, connect=600.0, pool=600.0
     )
-    return _new_client
+
+    httpx_client = AsyncHTTPHandler(
+        timeout=timeout, concurrent_limit=1000, **httpx_client_params
+    )
+    litellm.in_memory_llm_clients_cache.set_cache(_cache_key_name, httpx_client)
+    return httpx_client
 
 
 def _get_httpx_client(params: Optional[dict] = None, custom_llm_provider: Optional[str] = None) -> HTTPHandler:
@@ -917,6 +955,8 @@ def _get_httpx_client(params: Optional[dict] = None, custom_llm_provider: Option
 
     Caches the new client and returns it.
     """
+    verbose_proxy_logger.debug(f"🌐 Creating sync HTTP client for {custom_llm_provider or 'unknown'}")
+    
     _params_key_name = ""
     if params is not None:
         for key, value in params.items():
@@ -931,40 +971,207 @@ def _get_httpx_client(params: Optional[dict] = None, custom_llm_provider: Option
     if _cached_client:
         return _cached_client
 
+    # Check for multi-proxy configuration first
+    multi_proxy_config = None
+    try:
+        from litellm.proxy.proxy_config import global_proxy_config
+        if custom_llm_provider:
+            multi_proxy_config = global_proxy_config.get_multi_proxy_config(
+                custom_llm_provider=custom_llm_provider
+            )
+    except Exception as e:
+        verbose_logger.debug(f"Could not check multi-proxy config: {e}")
+        
     # Get proxy configuration from global proxy config (with error handling)
     proxy_config = None
     try:
         from litellm.proxy.proxy_config import global_proxy_config
-        proxy_config = global_proxy_config.get_httpx_proxy_config(custom_llm_provider=custom_llm_provider)
+        if multi_proxy_config:
+            verbose_proxy_logger.info(
+                f"🔄 Multi-proxy configuration detected for {custom_llm_provider}, "
+                f"will use dynamic proxy selection"
+            )
+            # For multi-proxy, get the next available proxy
+            proxy_config = global_proxy_config.get_next_available_proxy(
+                custom_llm_provider=custom_llm_provider
+            )
+            if proxy_config:
+                # Convert to httpx format
+                httpx_proxy_config = {}
+                if proxy_config.get('http'):
+                    httpx_proxy_config['http://'] = proxy_config['http']
+                if proxy_config.get('https'):
+                    httpx_proxy_config['https://'] = proxy_config['https']
+                proxy_config = httpx_proxy_config
+        else:
+            # Use regular proxy configuration
+            proxy_config = global_proxy_config.get_httpx_proxy_config(custom_llm_provider=custom_llm_provider)
     except (ImportError, AttributeError, Exception) as e:
         # If proxy config is not available, continue without proxy
         verbose_logger.debug(f"Proxy config not available: {e}")
         proxy_config = None
-    
+        
     # 🔍 添加代理配置日志打印
     if proxy_config:
-        verbose_logger.info(f"🌐 [PROXY] Creating HTTP client for {custom_llm_provider or 'unknown'} with proxy config: {proxy_config}")
-        print(f"🌐 [PROXY] HTTP Client | Provider: {custom_llm_provider or 'unknown'} | Proxy Config: {proxy_config}")
+        proxy_type = "MULTI-PROXY" if multi_proxy_config else "PROXY"
+        verbose_proxy_logger.info(f"🌐 [{proxy_type}] Creating HTTP client for {custom_llm_provider or 'unknown'} with proxy config: {proxy_config}")
+        print(f"🌐 [{proxy_type}] HTTP Client | Provider: {custom_llm_provider or 'unknown'} | Proxy Config: {proxy_config}")
     else:
-        verbose_logger.debug(f"🌐 [PROXY] Creating HTTP client for {custom_llm_provider or 'unknown'} without proxy")
+        verbose_proxy_logger.debug(f"🌐 [PROXY] Creating HTTP client for {custom_llm_provider or 'unknown'} without proxy")
         print(f"🌐 [PROXY] HTTP Client | Provider: {custom_llm_provider or 'unknown'} | No proxy configured")
 
+    # Create params dict with proxy config if available
+    client_params = {}
     if params is not None:
-        # Add proxy config to params if available
-        if proxy_config:
-            params = params.copy()  # Don't modify original params
-            params['proxies'] = proxy_config
-        _new_client = HTTPHandler(**params)
-    else:
-        # Create params dict with proxy config if available
-        client_params = {"timeout": httpx.Timeout(timeout=600.0, connect=5.0)}
-        if proxy_config:
-            client_params['proxies'] = proxy_config
-        _new_client = HTTPHandler(**client_params)
+        client_params.update(params)
+    
+    # Add proxy config to params if available
+    if proxy_config:
+        client_params['proxies'] = proxy_config
 
-    litellm.in_memory_llm_clients_cache.set_cache(
-        key=_cache_key_name,
-        value=_new_client,
-        ttl=_DEFAULT_TTL_FOR_HTTPX_CLIENTS,
-    )
-    return _new_client
+    # Create params dict with proxy config if available
+    httpx_client_params = {}
+    if proxy_config:
+        httpx_client_params['proxies'] = proxy_config
+
+    # Default timeout and concurrent limit  
+    timeout = httpx.Timeout(timeout=600.0, connect=5.0)
+
+    httpx_client = HTTPHandler(timeout=timeout, concurrent_limit=1000, **httpx_client_params)
+    litellm.in_memory_llm_clients_cache.set_cache(_cache_key_name, httpx_client)
+    return httpx_client
+
+
+def get_simple_async_httpx_client(
+    llm_provider: str,
+    custom_llm_provider: Optional[str] = None,
+    api_base: Optional[str] = None,
+    timeout: Optional[Union[float, httpx.Timeout]] = None,
+    **kwargs
+) -> httpx.AsyncClient:
+    """
+    Get async httpx client with proxy configuration if available
+    """
+    verbose_proxy_logger.debug(f"🌐 Creating async HTTP client for {custom_llm_provider or llm_provider}")
+    
+    # Get proxy configuration
+    try:
+        from litellm.proxy.proxy_config import global_proxy_config
+        
+        # Check for multi-proxy configuration first
+        multi_proxy_config = global_proxy_config.get_multi_proxy_config(
+            custom_llm_provider=custom_llm_provider
+        )
+        
+        if multi_proxy_config:
+            verbose_proxy_logger.info(
+                f"🔄 Multi-proxy configuration detected for {custom_llm_provider}, "
+                f"will use dynamic proxy selection"
+            )
+            # For multi-proxy, we don't set a fixed proxy here
+            # The proxy will be selected dynamically in the request handler
+            proxy_config = None
+        else:
+            # Get regular proxy configuration
+            proxy_config = global_proxy_config.get_httpx_proxy_config(
+                custom_llm_provider=custom_llm_provider
+            )
+            
+            if proxy_config:
+                verbose_proxy_logger.info(
+                    f"🔗 Using single proxy configuration for {custom_llm_provider}: {proxy_config}"
+                )
+            else:
+                verbose_proxy_logger.debug(f"📝 No proxy configuration for {custom_llm_provider}")
+                
+    except ImportError:
+        verbose_proxy_logger.debug("⚠️  Proxy configuration module not available")
+        proxy_config = None
+    except Exception as e:
+        verbose_proxy_logger.warning(f"⚠️  Error getting proxy configuration: {e}")
+        proxy_config = None
+    
+    # Create client configuration
+    client_config = {}
+    
+    if proxy_config:
+        client_config['proxies'] = proxy_config
+        verbose_proxy_logger.info(f"✅ HTTP client will use proxy: {proxy_config}")
+    
+    if timeout:
+        client_config['timeout'] = timeout
+        verbose_proxy_logger.debug(f"⏱️  HTTP client timeout: {timeout}")
+    
+    # Add any additional kwargs
+    client_config.update(kwargs)
+    
+    verbose_proxy_logger.debug(f"🔧 Final HTTP client config: {client_config}")
+    
+    return httpx.AsyncClient(**client_config)
+
+
+def get_simple_sync_httpx_client(
+    llm_provider: str,
+    custom_llm_provider: Optional[str] = None,
+    api_base: Optional[str] = None,
+    timeout: Optional[Union[float, httpx.Timeout]] = None,
+    **kwargs
+) -> httpx.Client:
+    """
+    Get sync httpx client with proxy configuration if available
+    """
+    verbose_proxy_logger.debug(f"🌐 Creating sync HTTP client for {custom_llm_provider or llm_provider}")
+    
+    # Get proxy configuration
+    try:
+        from litellm.proxy.proxy_config import global_proxy_config
+        
+        # Check for multi-proxy configuration first
+        multi_proxy_config = global_proxy_config.get_multi_proxy_config(
+            custom_llm_provider=custom_llm_provider
+        )
+        
+        if multi_proxy_config:
+            verbose_proxy_logger.info(
+                f"🔄 Multi-proxy configuration detected for {custom_llm_provider}, "
+                f"will use dynamic proxy selection"
+            )
+            # For multi-proxy, we don't set a fixed proxy here
+            proxy_config = None
+        else:
+            # Get regular proxy configuration
+            proxy_config = global_proxy_config.get_httpx_proxy_config(
+                custom_llm_provider=custom_llm_provider
+            )
+            
+            if proxy_config:
+                verbose_proxy_logger.info(
+                    f"🔗 Using single proxy configuration for {custom_llm_provider}: {proxy_config}"
+                )
+            else:
+                verbose_proxy_logger.debug(f"📝 No proxy configuration for {custom_llm_provider}")
+                
+    except ImportError:
+        verbose_proxy_logger.debug("⚠️  Proxy configuration module not available")
+        proxy_config = None
+    except Exception as e:
+        verbose_proxy_logger.warning(f"⚠️  Error getting proxy configuration: {e}")
+        proxy_config = None
+    
+    # Create client configuration
+    client_config = {}
+    
+    if proxy_config:
+        client_config['proxies'] = proxy_config
+        verbose_proxy_logger.info(f"✅ HTTP client will use proxy: {proxy_config}")
+    
+    if timeout:
+        client_config['timeout'] = timeout
+        verbose_proxy_logger.debug(f"⏱️  HTTP client timeout: {timeout}")
+    
+    # Add any additional kwargs
+    client_config.update(kwargs)
+    
+    verbose_proxy_logger.debug(f"🔧 Final HTTP client config: {client_config}")
+    
+    return httpx.Client(**client_config)

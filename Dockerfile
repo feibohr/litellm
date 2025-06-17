@@ -69,9 +69,13 @@ RUN prisma generate
 RUN chmod +x docker/entrypoint.sh
 RUN chmod +x docker/prod_entrypoint.sh
 
+# Set environment variables for cleaner logs
+ENV LITELLM_LOG=ERROR
+ENV JSON_LOGS=false
+
 EXPOSE 4000/tcp
 
 ENTRYPOINT ["docker/prod_entrypoint.sh"]
 
-# 🚀 修复K8s部署问题：绑定到0.0.0.0而不是127.0.0.1
+# 🚀 修复K8s部署问题并减少DEBUG日志
 CMD ["--port", "4000", "--host", "0.0.0.0"]

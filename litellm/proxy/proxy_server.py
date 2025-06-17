@@ -742,6 +742,750 @@ async def openai_exception_handler(request: Request, exc: ProxyException):
 
 
 router = APIRouter()
+import asyncio
+import copy
+import inspect
+import io
+import os
+import random
+import secrets
+import subprocess
+import sys
+import time
+import traceback
+import uuid
+import warnings
+from datetime import datetime, timedelta
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    List,
+    Optional,
+    Tuple,
+    Union,
+    cast,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
+
+from litellm.constants import (
+    DEFAULT_MAX_RECURSE_DEPTH,
+    DEFAULT_SLACK_ALERTING_THRESHOLD,
+    LITELLM_EMBEDDING_PROVIDERS_SUPPORTING_INPUT_ARRAY_OF_TOKENS,
+    LITELLM_SETTINGS_SAFE_DB_OVERRIDES,
+)
+from litellm.types.utils import (
+    ModelResponse,
+    ModelResponseStream,
+    TextCompletionResponse,
+)
+
+if TYPE_CHECKING:
+    from opentelemetry.trace import Span as _Span
+
+    from litellm.integrations.opentelemetry import OpenTelemetry
+
+    Span = Union[_Span, Any]
+else:
+    Span = Any
+    OpenTelemetry = Any
+
+
+def showwarning(message, category, filename, lineno, file=None, line=None):
+    traceback_info = f"{filename}:{lineno}: {category.__name__}: {message}\n"
+    if file is not None:
+        file.write(traceback_info)
+
+
+warnings.showwarning = showwarning
+warnings.filterwarnings("default", category=UserWarning)
+
+# Your client code here
+
+
+messages: list = []
+sys.path.insert(
+    0, os.path.abspath("../..")
+)  # Adds the parent directory to the system path - for litellm local dev
+
+try:
+    import logging
+
+    import backoff
+    import fastapi
+    import orjson
+    import yaml  # type: ignore
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+except ImportError as e:
+    raise ImportError(f"Missing dependency {e}. Run `pip install 'litellm[proxy]'`")
+
+list_of_messages = [
+    "'The thing I wish you improved is...'",
+    "'A feature I really want is...'",
+    "'The worst thing about this product is...'",
+    "'This product would be better if...'",
+    "'I don't like how this works...'",
+    "'It would help me if you could add...'",
+    "'This feature doesn't meet my needs because...'",
+    "'I get frustrated when the product...'",
+]
+
+
+def generate_feedback_box():
+    box_width = 60
+
+    # Select a random message
+    message = random.choice(list_of_messages)
+
+    print()  # noqa
+    print("\033[1;37m" + "#" + "-" * box_width + "#\033[0m")  # noqa
+    print("\033[1;37m" + "#" + " " * box_width + "#\033[0m")  # noqa
+    print("\033[1;37m" + "# {:^59} #\033[0m".format(message))  # noqa
+    print(  # noqa
+        "\033[1;37m"
+        + "# {:^59} #\033[0m".format("https://github.com/BerriAI/litellm/issues/new")
+    )  # noqa
+    print("\033[1;37m" + "#" + " " * box_width + "#\033[0m")  # noqa
+    print("\033[1;37m" + "#" + "-" * box_width + "#\033[0m")  # noqa
+    print()  # noqa
+    print(" Thank you for using LiteLLM! - Krrish & Ishaan")  # noqa
+    print()  # noqa
+    print()  # noqa
+    print()  # noqa
+    print(  # noqa
+        "\033[1;31mGive Feedback / Get Help: https://github.com/BerriAI/litellm/issues/new\033[0m"
+    )  # noqa
+    print()  # noqa
+    print()  # noqa
+
+
+from collections import defaultdict
+from contextlib import asynccontextmanager
+
+import litellm
+from litellm import Router
+from litellm._logging import verbose_proxy_logger, verbose_router_logger
+from litellm.caching.caching import DualCache, RedisCache
+from litellm.constants import (
+    DAYS_IN_A_MONTH,
+    DEFAULT_HEALTH_CHECK_INTERVAL,
+    DEFAULT_MODEL_CREATED_AT_TIME,
+    LITELLM_PROXY_ADMIN_NAME,
+    PROMETHEUS_FALLBACK_STATS_SEND_TIME_HOURS,
+    PROXY_BATCH_WRITE_AT,
+    PROXY_BUDGET_RESCHEDULER_MAX_TIME,
+    PROXY_BUDGET_RESCHEDULER_MIN_TIME,
+)
+from litellm.exceptions import RejectedRequestError
+from litellm.integrations.SlackAlerting.slack_alerting import SlackAlerting
+from litellm.litellm_core_utils.core_helpers import (
+    _get_parent_otel_span_from_kwargs,
+    get_litellm_metadata_from_kwargs,
+)
+from litellm.litellm_core_utils.credential_accessor import CredentialAccessor
+from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
+from litellm.litellm_core_utils.sensitive_data_masker import SensitiveDataMasker
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
+from litellm.proxy._experimental.mcp_server.server import router as mcp_router
+from litellm.proxy._experimental.mcp_server.tool_registry import (
+    global_mcp_tool_registry,
+)
+from litellm.proxy._types import *
+from litellm.proxy.analytics_endpoints.analytics_endpoints import (
+    router as analytics_router,
+)
+from litellm.proxy.anthropic_endpoints.endpoints import router as anthropic_router
+from litellm.proxy.auth.auth_checks import (
+    ExperimentalUIJWTToken,
+    get_team_object,
+    log_db_metrics,
+)
+from litellm.proxy.auth.auth_utils import check_response_size_is_safe
+from litellm.proxy.auth.handle_jwt import JWTHandler
+from litellm.proxy.auth.litellm_license import LicenseCheck
+from litellm.proxy.auth.model_checks import (
+    get_complete_model_list,
+    get_key_models,
+    get_team_models,
+)
+from litellm.proxy.auth.user_api_key_auth import (
+    user_api_key_auth,
+    user_api_key_auth_websocket,
+)
+from litellm.proxy.batches_endpoints.endpoints import router as batches_router
+
+## Import All Misc routes here ##
+from litellm.proxy.caching_routes import router as caching_router
+from litellm.proxy.common_request_processing import (
+    ProxyBaseLLMRequestProcessing,
+    create_streaming_response,
+)
+from litellm.proxy.common_utils.callback_utils import initialize_callbacks_on_proxy
+from litellm.proxy.common_utils.debug_utils import init_verbose_loggers
+from litellm.proxy.common_utils.debug_utils import router as debugging_endpoints_router
+from litellm.proxy.common_utils.encrypt_decrypt_utils import (
+    decrypt_value_helper,
+    encrypt_value_helper,
+)
+from litellm.proxy.common_utils.html_forms.ui_login import html_form
+from litellm.proxy.common_utils.http_parsing_utils import (
+    _read_request_body,
+    check_file_size_under_limit,
+    get_form_data,
+)
+from litellm.proxy.common_utils.load_config_utils import (
+    get_config_file_contents_from_gcs,
+    get_file_contents_from_s3,
+)
+from litellm.proxy.common_utils.openai_endpoint_utils import (
+    remove_sensitive_info_from_deployment,
+)
+from litellm.proxy.common_utils.proxy_state import ProxyState
+from litellm.proxy.common_utils.reset_budget_job import ResetBudgetJob
+from litellm.proxy.common_utils.swagger_utils import ERROR_RESPONSES
+from litellm.proxy.credential_endpoints.endpoints import router as credential_router
+from litellm.proxy.db.db_transaction_queue.spend_log_cleanup import SpendLogCleanup
+from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
+from litellm.proxy.discovery_endpoints import ui_discovery_endpoints_router
+from litellm.proxy.fine_tuning_endpoints.endpoints import router as fine_tuning_router
+from litellm.proxy.fine_tuning_endpoints.endpoints import set_fine_tuning_config
+from litellm.proxy.guardrails.guardrail_endpoints import router as guardrails_router
+from litellm.proxy.guardrails.init_guardrails import (
+    init_guardrails_v2,
+    initialize_guardrails,
+)
+from litellm.proxy.health_check import perform_health_check
+from litellm.proxy.health_endpoints._health_endpoints import router as health_router
+from litellm.proxy.hooks.model_max_budget_limiter import (
+    _PROXY_VirtualKeyModelMaxBudgetLimiter,
+)
+from litellm.proxy.hooks.prompt_injection_detection import (
+    _OPTIONAL_PromptInjectionDetection,
+)
+from litellm.proxy.hooks.proxy_track_cost_callback import _ProxyDBLogger
+from litellm.proxy.image_endpoints.endpoints import router as image_router
+from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
+from litellm.proxy.management_endpoints.budget_management_endpoints import (
+    router as budget_management_router,
+)
+from litellm.proxy.management_endpoints.common_utils import _user_has_admin_view
+from litellm.proxy.management_endpoints.customer_endpoints import (
+    router as customer_router,
+)
+from litellm.proxy.management_endpoints.internal_user_endpoints import (
+    router as internal_user_router,
+)
+from litellm.proxy.management_endpoints.internal_user_endpoints import user_update
+from litellm.proxy.management_endpoints.key_management_endpoints import (
+    delete_verification_tokens,
+    duration_in_seconds,
+    generate_key_helper_fn,
+)
+from litellm.proxy.management_endpoints.key_management_endpoints import (
+    router as key_management_router,
+)
+from litellm.proxy.management_endpoints.mcp_management_endpoints import (
+    router as mcp_management_router,
+)
+from litellm.proxy.management_endpoints.model_management_endpoints import (
+    _add_model_to_db,
+    _add_team_model_to_db,
+    _deduplicate_litellm_router_models,
+)
+from litellm.proxy.management_endpoints.model_management_endpoints import (
+    router as model_management_router,
+)
+from litellm.proxy.management_endpoints.organization_endpoints import (
+    router as organization_router,
+)
+from litellm.proxy.management_endpoints.scim.scim_v2 import scim_router
+from litellm.proxy.management_endpoints.tag_management_endpoints import (
+    router as tag_management_router,
+)
+from litellm.proxy.management_endpoints.team_callback_endpoints import (
+    router as team_callback_router,
+)
+from litellm.proxy.management_endpoints.team_endpoints import router as team_router
+from litellm.proxy.management_endpoints.team_endpoints import (
+    update_team,
+    validate_membership,
+)
+from litellm.proxy.management_endpoints.ui_sso import (
+    get_disabled_non_admin_personal_key_creation,
+)
+from litellm.proxy.management_endpoints.ui_sso import router as ui_sso_router
+from litellm.proxy.management_helpers.audit_logs import create_audit_log_for_update
+from litellm.proxy.middleware.prometheus_auth_middleware import PrometheusAuthMiddleware
+from litellm.proxy.openai_files_endpoints.files_endpoints import (
+    router as openai_files_router,
+)
+from litellm.proxy.openai_files_endpoints.files_endpoints import set_files_config
+from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+    passthrough_endpoint_router,
+)
+from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+    router as llm_passthrough_router,
+)
+from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+    initialize_pass_through_endpoints,
+)
+from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+    router as pass_through_router,
+)
+from litellm.proxy.rerank_endpoints.endpoints import router as rerank_router
+from litellm.proxy.response_api_endpoints.endpoints import router as response_router
+from litellm.proxy.route_llm_request import route_request
+from litellm.proxy.spend_tracking.spend_management_endpoints import (
+    router as spend_management_router,
+)
+from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
+from litellm.proxy.types_utils.utils import get_instance_fn
+from litellm.proxy.ui_crud_endpoints.proxy_setting_endpoints import (
+    router as ui_crud_endpoints_router,
+)
+from litellm.proxy.utils import (
+    PrismaClient,
+    ProxyLogging,
+    ProxyUpdateSpend,
+    _cache_user_row,
+    _get_docs_url,
+    _get_projected_spend_over_limit,
+    _get_redoc_url,
+    _is_projected_spend_over_limit,
+    _is_valid_team_configs,
+    get_custom_url,
+    get_error_message_str,
+    get_server_root_path,
+    hash_token,
+    update_spend,
+)
+from litellm.proxy.vertex_ai_endpoints.langfuse_endpoints import (
+    router as langfuse_router,
+)
+from litellm.router import (
+    AssistantsTypedDict,
+    Deployment,
+    LiteLLM_Params,
+    ModelGroupInfo,
+)
+from litellm.scheduler import FlowItem, Scheduler
+from litellm.secret_managers.aws_secret_manager import load_aws_kms
+from litellm.secret_managers.google_kms import load_google_kms
+from litellm.secret_managers.main import (
+    get_secret,
+    get_secret_bool,
+    get_secret_str,
+    str_to_bool,
+)
+from litellm.types.integrations.slack_alerting import SlackAlertingArgs
+from litellm.types.llms.anthropic import (
+    AnthropicMessagesRequest,
+    AnthropicResponse,
+    AnthropicResponseContentBlockText,
+    AnthropicResponseUsageBlock,
+)
+from litellm.types.llms.openai import HttpxBinaryResponseContent
+from litellm.types.router import DeploymentTypedDict
+from litellm.types.router import ModelInfo as RouterModelInfo
+from litellm.types.router import RouterGeneralSettings, updateDeployment
+from litellm.types.scheduler import DefaultPriorities
+from litellm.types.utils import CredentialItem, CustomHuggingfaceTokenizer
+from litellm.types.utils import ModelInfo as ModelMapInfo
+from litellm.types.utils import RawRequestTypedDict, StandardLoggingPayload
+from litellm.utils import _add_custom_logger_callback_to_specific_event
+
+try:
+    from litellm._version import version
+except Exception:
+    version = "0.0.0"
+litellm.suppress_debug_info = True
+import json
+from typing import Union
+
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+    applications,
+    status,
+)
+from fastapi.encoders import jsonable_encoder
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.openapi.utils import get_openapi
+from fastapi.responses import (
+    FileResponse,
+    JSONResponse,
+    ORJSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
+from fastapi.routing import APIRouter
+from fastapi.security import OAuth2PasswordBearer
+from fastapi.security.api_key import APIKeyHeader
+from fastapi.staticfiles import StaticFiles
+
+# import enterprise folder
+enterprise_router = APIRouter()
+try:
+    # when using litellm cli
+    import litellm.proxy.enterprise as enterprise
+except Exception:
+    # when using litellm docker image
+    try:
+        import enterprise  # type: ignore
+    except Exception:
+        pass
+
+###################
+# Import enterprise routes
+try:
+    from litellm_enterprise.proxy.enterprise_routes import router as _enterprise_router
+    from litellm_enterprise.proxy.proxy_server import EnterpriseProxyConfig
+
+    enterprise_router = _enterprise_router
+    enterprise_proxy_config: Optional[EnterpriseProxyConfig] = EnterpriseProxyConfig()
+except ImportError:
+    enterprise_proxy_config = None
+###################
+
+server_root_path = os.getenv("SERVER_ROOT_PATH", "")
+_license_check = LicenseCheck()
+premium_user: bool = _license_check.is_premium()
+global_max_parallel_request_retries_env: Optional[str] = os.getenv(
+    "LITELLM_GLOBAL_MAX_PARALLEL_REQUEST_RETRIES"
+)
+proxy_state = ProxyState()
+SENSITIVE_DATA_MASKER = SensitiveDataMasker()
+if global_max_parallel_request_retries_env is None:
+    global_max_parallel_request_retries: int = 3
+else:
+    global_max_parallel_request_retries = int(global_max_parallel_request_retries_env)
+
+global_max_parallel_request_retry_timeout_env: Optional[str] = os.getenv(
+    "LITELLM_GLOBAL_MAX_PARALLEL_REQUEST_RETRY_TIMEOUT"
+)
+if global_max_parallel_request_retry_timeout_env is None:
+    global_max_parallel_request_retry_timeout: float = 60.0
+else:
+    global_max_parallel_request_retry_timeout = float(
+        global_max_parallel_request_retry_timeout_env
+    )
+
+ui_link = f"{server_root_path}/ui/"
+ui_message = (
+    f"👉 [```LiteLLM Admin Panel on /ui```]({ui_link}). Create, Edit Keys with SSO"
+)
+ui_message += "\n\n💸 [```LiteLLM Model Cost Map```](https://models.litellm.ai/)."
+
+custom_swagger_message = "[**Customize Swagger Docs**](https://docs.litellm.ai/docs/proxy/enterprise#swagger-docs---custom-routes--branding)"
+
+### CUSTOM BRANDING [ENTERPRISE FEATURE] ###
+_title = os.getenv("DOCS_TITLE", "LiteLLM API") if premium_user else "LiteLLM API"
+_description = (
+    os.getenv(
+        "DOCS_DESCRIPTION",
+        f"Enterprise Edition \n\nProxy Server to call 100+ LLMs in the OpenAI format. {custom_swagger_message}\n\n{ui_message}",
+    )
+    if premium_user
+    else f"Proxy Server to call 100+ LLMs in the OpenAI format. {custom_swagger_message}\n\n{ui_message}"
+)
+
+
+def cleanup_router_config_variables():
+    global master_key, user_config_file_path, otel_logging, user_custom_auth, user_custom_auth_path, user_custom_key_generate, user_custom_sso, use_background_health_checks, health_check_interval, prisma_client
+
+    # Set all variables to None
+    master_key = None
+    user_config_file_path = None
+    otel_logging = None
+    user_custom_auth = None
+    user_custom_auth_path = None
+    user_custom_key_generate = None
+    user_custom_sso = None
+    use_background_health_checks = None
+    health_check_interval = None
+    prisma_client = None
+
+
+async def proxy_shutdown_event():
+    global prisma_client, master_key, user_custom_auth, user_custom_key_generate
+    verbose_proxy_logger.info("Shutting down LiteLLM Proxy Server")
+    if prisma_client:
+        verbose_proxy_logger.debug("Disconnecting from Prisma")
+        await prisma_client.disconnect()
+
+    if litellm.cache is not None:
+        await litellm.cache.disconnect()
+
+    await jwt_handler.close()
+
+    if db_writer_client is not None:
+        await db_writer_client.close()
+
+    # flush remaining langfuse logs
+    if "langfuse" in litellm.success_callback:
+        try:
+            # flush langfuse logs on shutdow
+            from litellm.utils import langFuseLogger
+
+            if langFuseLogger is not None:
+                langFuseLogger.Langfuse.flush()
+        except Exception:
+            # [DO NOT BLOCK shutdown events for this]
+            pass
+
+    ## RESET CUSTOM VARIABLES ##
+    cleanup_router_config_variables()
+
+
+@asynccontextmanager
+async def proxy_startup_event(app: FastAPI):
+    global prisma_client, master_key, use_background_health_checks, llm_router, llm_model_list, general_settings, proxy_budget_rescheduler_min_time, proxy_budget_rescheduler_max_time, litellm_proxy_admin_name, db_writer_client, store_model_in_db, premium_user, _license_check
+    import json
+
+    init_verbose_loggers()
+    ## CHECK PREMIUM USER
+    verbose_proxy_logger.debug(
+        "litellm.proxy.proxy_server.py::startup() - CHECKING PREMIUM USER - {}".format(
+            premium_user
+        )
+    )
+    if premium_user is False:
+        premium_user = _license_check.is_premium()
+
+    ## CHECK MASTER KEY IN ENVIRONMENT ##
+    master_key = get_secret_str("LITELLM_MASTER_KEY")
+    ### LOAD CONFIG ###
+    worker_config: Optional[Union[str, dict]] = get_secret("WORKER_CONFIG")  # type: ignore
+    env_config_yaml: Optional[str] = get_secret_str("CONFIG_FILE_PATH")
+    verbose_proxy_logger.debug("worker_config: %s", worker_config)
+    # check if it's a valid file path
+    if env_config_yaml is not None:
+        if os.path.isfile(env_config_yaml) and proxy_config.is_yaml(
+            config_file_path=env_config_yaml
+        ):
+            (
+                llm_router,
+                llm_model_list,
+                general_settings,
+            ) = await proxy_config.load_config(
+                router=llm_router, config_file_path=env_config_yaml
+            )
+    elif worker_config is not None:
+        if (
+            isinstance(worker_config, str)
+            and os.path.isfile(worker_config)
+            and proxy_config.is_yaml(config_file_path=worker_config)
+        ):
+            (
+                llm_router,
+                llm_model_list,
+                general_settings,
+            ) = await proxy_config.load_config(
+                router=llm_router, config_file_path=worker_config
+            )
+        elif os.environ.get("LITELLM_CONFIG_BUCKET_NAME") is not None and isinstance(
+            worker_config, str
+        ):
+            (
+                llm_router,
+                llm_model_list,
+                general_settings,
+            ) = await proxy_config.load_config(
+                router=llm_router, config_file_path=worker_config
+            )
+        elif isinstance(worker_config, dict):
+            await initialize(**worker_config)
+        else:
+            # if not, assume it's a json string
+            worker_config = json.loads(worker_config)
+            if isinstance(worker_config, dict):
+                await initialize(**worker_config)
+
+    # check if DATABASE_URL in environment - load from there
+    if prisma_client is None:
+        _db_url: Optional[str] = get_secret("DATABASE_URL", None)  # type: ignore
+        prisma_client = await ProxyStartupEvent._setup_prisma_client(
+            database_url=_db_url,
+            proxy_logging_obj=proxy_logging_obj,
+            user_api_key_cache=user_api_key_cache,
+        )
+
+    ProxyStartupEvent._initialize_startup_logging(
+        llm_router=llm_router,
+        proxy_logging_obj=proxy_logging_obj,
+        redis_usage_cache=redis_usage_cache,
+    )
+
+    ## JWT AUTH ##
+    ProxyStartupEvent._initialize_jwt_auth(
+        general_settings=general_settings,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+    )
+
+    if use_background_health_checks:
+        asyncio.create_task(
+            _run_background_health_check()
+        )  # start the background health check coroutine.
+
+    if prompt_injection_detection_obj is not None:  # [TODO] - REFACTOR THIS
+        prompt_injection_detection_obj.update_environment(router=llm_router)
+
+    verbose_proxy_logger.debug("prisma_client: %s", prisma_client)
+    if prisma_client is not None and litellm.max_budget > 0:
+        ProxyStartupEvent._add_proxy_budget_to_db(
+            litellm_proxy_budget_name=litellm_proxy_admin_name
+        )
+
+    ### START BATCH WRITING DB + CHECKING NEW MODELS###
+    if prisma_client is not None:
+        await ProxyStartupEvent.initialize_scheduled_background_jobs(
+            general_settings=general_settings,
+            prisma_client=prisma_client,
+            proxy_budget_rescheduler_min_time=proxy_budget_rescheduler_min_time,
+            proxy_budget_rescheduler_max_time=proxy_budget_rescheduler_max_time,
+            proxy_batch_write_at=proxy_batch_write_at,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+
+    ## [Optional] Initialize dd tracer
+    ProxyStartupEvent._init_dd_tracer()
+
+    # Initialize proxy configuration system 
+    from litellm.proxy.utils import initialize_proxy_config_from_db
+    if prisma_client is not None:
+        await initialize_proxy_config_from_db(prisma_client)
+
+    # End of startup event
+    yield
+
+    # Shutdown event
+    await proxy_shutdown_event()
+
+
+app = FastAPI(
+    docs_url=_get_docs_url(),
+    redoc_url=_get_redoc_url(),
+    title=_title,
+    description=_description,
+    version=version,
+    root_path=server_root_path,  # check if user passed root path, FastAPI defaults this value to ""
+    lifespan=proxy_startup_event,
+)
+
+
+### CUSTOM API DOCS [ENTERPRISE FEATURE] ###
+# Custom OpenAPI schema generator to include only selected routes
+from fastapi.routing import APIWebSocketRoute
+
+
+def get_openapi_schema():
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    openapi_schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+
+    # Find all WebSocket routes
+    websocket_routes = [
+        route for route in app.routes if isinstance(route, APIWebSocketRoute)
+    ]
+
+    # Add each WebSocket route to the schema
+    for route in websocket_routes:
+        # Get the base path without query parameters
+        base_path = route.path.split("{")[0].rstrip("?")
+
+        # Extract parameters from the route
+        parameters = []
+        if hasattr(route, "dependant"):
+            for param in route.dependant.query_params:
+                parameters.append(
+                    {
+                        "name": param.name,
+                        "in": "query",
+                        "required": param.required,
+                        "schema": {
+                            "type": "string"
+                        },  # You can make this more specific if needed
+                    }
+                )
+
+        openapi_schema["paths"][base_path] = {
+            "get": {
+                "summary": f"WebSocket: {route.name or base_path}",
+                "description": "WebSocket connection endpoint",
+                "operationId": f"websocket_{route.name or base_path.replace('/', '_')}",
+                "parameters": parameters,
+                "responses": {"101": {"description": "WebSocket Protocol Switched"}},
+                "tags": ["WebSocket"],
+            }
+        }
+
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    openapi_schema = get_openapi_schema()
+
+    # Filter routes to include only specific ones
+    openai_routes = LiteLLMRoutes.openai_routes.value
+    paths_to_include: dict = {}
+    for route in openai_routes:
+        if route in openapi_schema["paths"]:
+            paths_to_include[route] = openapi_schema["paths"][route]
+    openapi_schema["paths"] = paths_to_include
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+
+if os.getenv("DOCS_FILTERED", "False") == "True" and premium_user:
+    app.openapi = custom_openapi  # type: ignore
+
+
+class UserAPIKeyCacheTTLEnum(enum.Enum):
+    in_memory_cache_ttl = 60  # 1 min ttl ## configure via `general_settings::user_api_key_cache_ttl: <your-value>`
+
+
+@app.exception_handler(ProxyException)
+async def openai_exception_handler(request: Request, exc: ProxyException):
+    # NOTE: DO NOT MODIFY THIS, its crucial to map to Openai exceptions
+    headers = exc.headers
+    return JSONResponse(
+        status_code=(
+            int(exc.code) if exc.code else status.HTTP_500_INTERNAL_SERVER_ERROR
+        ),
+        content={
+            "error": {
+                "message": exc.message,
+                "type": exc.type,
+                "param": exc.param,
+                "code": exc.code,
+            }
+        },
+        headers=headers,
+    )
+
+
+router = APIRouter()
 origins = ["*"]
 
 

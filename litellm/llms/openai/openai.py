@@ -25,7 +25,7 @@ from typing_extensions import overload
 
 import litellm
 from litellm import LlmProviders
-from litellm._logging import verbose_logger
+from litellm._logging import verbose_logger, verbose_proxy_logger
 from litellm.constants import DEFAULT_MAX_RETRIES
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.litellm_core_utils.logging_utils import track_llm_api_timing
@@ -411,15 +411,81 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
         Helper to:
         - call chat.completions.create.with_raw_response when litellm.return_response_headers is True
         - call chat.completions.create by default
+        - Support multi-proxy retry for connection failures
         """
         start_time = time.time()
+        
+        # Check if this is a multi-proxy configuration
         try:
+            from litellm.proxy.proxy_config import global_proxy_config
+            from litellm.proxy.multi_proxy_handler import multi_proxy_handler
+            
+            # Get custom_llm_provider from client's base_url
+            custom_llm_provider = None
+            if hasattr(openai_aclient, "_client") and hasattr(openai_aclient._client, "_base_url"):
+                base_url = str(openai_aclient._client._base_url)
+                if "openrouter.ai" in base_url:
+                    custom_llm_provider = "openrouter"
+                elif "azure" in base_url:
+                    custom_llm_provider = "azure"
+                # Add more provider detection as needed
+            
+            # Log the provider detection
+            if custom_llm_provider:
+                verbose_proxy_logger.info(f"🔍 Detected provider: {custom_llm_provider} from base_url: {base_url}")
+            
+            # Check if multi-proxy configuration exists
+            multi_proxy_config = global_proxy_config.get_multi_proxy_config(
+                custom_llm_provider=custom_llm_provider
+            )
+            
+            if multi_proxy_config and custom_llm_provider:
+                verbose_proxy_logger.info(
+                    f"🔄 Multi-proxy configuration detected for {custom_llm_provider}: "
+                    f"{len(multi_proxy_config.get('proxies', []))} proxies available, "
+                    f"retry_count={multi_proxy_config.get('retry_count', 3)}, "
+                    f"retry_delay={multi_proxy_config.get('retry_delay', 1.0)}s"
+                )
+                
+                # Use multi-proxy retry mechanism
+                async def make_request_with_retry():
+                    return await multi_proxy_handler.execute_with_proxy_retry(
+                        func=self._make_single_openai_request,
+                        custom_llm_provider=custom_llm_provider,
+                        openai_aclient=openai_aclient,
+                        data=data,
+                        timeout=timeout
+                    )
+                
+                headers, response = await make_request_with_retry()
+                end_time = time.time()
+                verbose_proxy_logger.info(
+                    f"✅ Multi-proxy request completed for {custom_llm_provider} in {end_time - start_time:.2f}s"
+                )
+                return headers, response
+            else:
+                if custom_llm_provider:
+                    verbose_proxy_logger.info(f"📝 No multi-proxy configuration found for {custom_llm_provider}, using standard request")
+                else:
+                    verbose_proxy_logger.debug("📝 No provider detected, using standard request")
+                
+        except ImportError:
+            # Multi-proxy handler not available, fall back to regular request
+            verbose_proxy_logger.warning("⚠️  Multi-proxy handler not available, falling back to regular request")
+        except Exception as e:
+            # Log but don't fail on multi-proxy setup errors
+            verbose_proxy_logger.error(f"❌ Multi-proxy setup error: {e}")
+        
+        # Regular single request
+        try:
+            verbose_proxy_logger.info("🌐 Executing standard OpenAI request (no multi-proxy)")
             raw_response = (
                 await openai_aclient.chat.completions.with_raw_response.create(
                     **data, timeout=timeout
                 )
             )
             end_time = time.time()
+            verbose_proxy_logger.info(f"✅ Standard request completed in {end_time - start_time:.2f}s")
 
             if hasattr(raw_response, "headers"):
                 headers = dict(raw_response.headers)
@@ -431,9 +497,89 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
             end_time = time.time()
             time_delta = round(end_time - start_time, 2)
             e.message += f" - timeout value={timeout}, time taken={time_delta} seconds"
+            verbose_proxy_logger.error(f"⏰ Request timeout after {time_delta}s")
             raise e
         except Exception as e:
+            verbose_proxy_logger.error(f"❌ Standard request failed: {e}")
             raise e
+    
+    async def _make_single_openai_request(
+        self,
+        openai_aclient: AsyncOpenAI,
+        data: dict,
+        timeout: Union[float, httpx.Timeout],
+        proxy_config: Optional[dict] = None
+    ) -> Tuple[dict, BaseModel]:
+        """
+        Make a single OpenAI request with specific proxy configuration
+        """
+        # If proxy_config is provided, create a new client with that proxy
+        if proxy_config:
+            # Create new client with specific proxy
+            import httpx
+            from openai import AsyncOpenAI
+            
+            httpx_config = {}
+            if proxy_config.get('http'):
+                httpx_config['http://'] = proxy_config['http']
+            if proxy_config.get('https'):
+                httpx_config['https://'] = proxy_config['https']
+            
+            verbose_proxy_logger.info(
+                f"🔗 Creating OpenAI client with proxy: {httpx_config}"
+            )
+            
+            # Create httpx client with proxy
+            httpx_client = httpx.AsyncClient(proxies=httpx_config, timeout=timeout)
+            
+            # Create new OpenAI client with proxy-enabled httpx client
+            proxy_openai_client = AsyncOpenAI(
+                api_key=openai_aclient.api_key,
+                base_url=openai_aclient.base_url,
+                http_client=httpx_client
+            )
+            
+            try:
+                verbose_proxy_logger.info(f"📤 Sending request via proxy: {proxy_config.get('http', 'N/A')}")
+                raw_response = await proxy_openai_client.chat.completions.with_raw_response.create(
+                    **data, timeout=timeout
+                )
+                
+                verbose_proxy_logger.info(f"✅ Proxy request successful via: {proxy_config.get('http', 'N/A')}")
+                
+                if hasattr(raw_response, "headers"):
+                    headers = dict(raw_response.headers)
+                else:
+                    headers = {}
+                response = raw_response.parse()
+                return headers, response
+                
+            except Exception as e:
+                verbose_proxy_logger.error(
+                    f"❌ Proxy request failed via {proxy_config.get('http', 'N/A')}: {type(e).__name__}: {e}"
+                )
+                raise e
+            finally:
+                # Clean up the proxy client
+                try:
+                    await httpx_client.aclose()
+                    await proxy_openai_client.close()
+                    verbose_proxy_logger.debug(f"🧹 Cleaned up proxy client for {proxy_config.get('http', 'N/A')}")
+                except Exception as cleanup_error:
+                    verbose_proxy_logger.warning(f"⚠️  Failed to cleanup proxy client: {cleanup_error}")
+        else:
+            # Use the original client
+            verbose_proxy_logger.info("📤 Sending request via original client (no specific proxy)")
+            raw_response = await openai_aclient.chat.completions.with_raw_response.create(
+                **data, timeout=timeout
+            )
+            
+            if hasattr(raw_response, "headers"):
+                headers = dict(raw_response.headers)
+            else:
+                headers = {}
+            response = raw_response.parse()
+            return headers, response
 
     @track_llm_api_timing()
     def make_sync_openai_chat_completion_request(

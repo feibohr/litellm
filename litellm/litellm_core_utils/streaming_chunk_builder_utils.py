@@ -258,14 +258,27 @@ class ChunkProcessor:
         completion_tokens_details: Optional[CompletionTokensDetails] = None
         prompt_tokens_details: Optional[PromptTokensDetails] = None
 
-        if "prompt_tokens" in usage_chunk:
+        # Handle Usage objects properly
+        if hasattr(usage_chunk, 'prompt_tokens'):
+            prompt_tokens = getattr(usage_chunk, 'prompt_tokens', 0) or 0
+        elif "prompt_tokens" in usage_chunk:
             prompt_tokens = usage_chunk.get("prompt_tokens", 0) or 0
-        if "completion_tokens" in usage_chunk:
+            
+        if hasattr(usage_chunk, 'completion_tokens'):
+            completion_tokens = getattr(usage_chunk, 'completion_tokens', 0) or 0
+        elif "completion_tokens" in usage_chunk:
             completion_tokens = usage_chunk.get("completion_tokens", 0) or 0
-        if "cache_creation_input_tokens" in usage_chunk:
+            
+        if hasattr(usage_chunk, 'cache_creation_input_tokens'):
+            cache_creation_input_tokens = getattr(usage_chunk, 'cache_creation_input_tokens', None)
+        elif "cache_creation_input_tokens" in usage_chunk:
             cache_creation_input_tokens = usage_chunk.get("cache_creation_input_tokens")
-        if "cache_read_input_tokens" in usage_chunk:
+            
+        if hasattr(usage_chunk, 'cache_read_input_tokens'):
+            cache_read_input_tokens = getattr(usage_chunk, 'cache_read_input_tokens', None)
+        elif "cache_read_input_tokens" in usage_chunk:
             cache_read_input_tokens = usage_chunk.get("cache_read_input_tokens")
+            
         if hasattr(usage_chunk, "completion_tokens_details"):
             if isinstance(usage_chunk.completion_tokens_details, dict):
                 completion_tokens_details = CompletionTokensDetails(

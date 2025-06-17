@@ -18,7 +18,7 @@ import litellm
 import litellm.litellm_core_utils
 import litellm.types
 import litellm.types.utils
-from litellm._logging import verbose_logger
+from litellm._logging import verbose_logger, verbose_proxy_logger
 from litellm.litellm_core_utils.realtime_streaming import RealTimeStreaming
 from litellm.llms.base_llm.anthropic_messages.transformation import (
     BaseAnthropicMessagesConfig,
@@ -74,6 +74,246 @@ else:
     LiteLLMLoggingObj = Any
 
 
+class MultiProxyStreamResponse:
+    """
+    Wrapper for httpx stream responses in multi-proxy scenarios
+    Properly manages the stream context manager lifecycle and handles retries
+    """
+    
+    def __init__(self, response: httpx.Response, stream_context, proxy_client, 
+                 api_base: str = None, headers: dict = None, data: dict = None, 
+                 signed_json_body: bytes = None, timeout = None, 
+                 custom_llm_provider: str = None):
+        self.response = response
+        self.stream_context = stream_context
+        self.proxy_client = proxy_client
+        self._closed = False
+        
+        # Store request parameters for retry
+        self.api_base = api_base
+        self.headers = headers or {}
+        self.data = data or {}
+        self.signed_json_body = signed_json_body
+        self.timeout = timeout
+        self.custom_llm_provider = custom_llm_provider
+        
+        # Track retry state
+        self.retry_attempted = False
+        self.chunks_received = 0
+    
+    def __getattr__(self, name):
+        # Delegate attribute access to the wrapped response
+        return getattr(self.response, name)
+    
+    def iter_lines(self):
+        """Synchronous line iteration"""
+        try:
+            for line in self.response.iter_lines():
+                self.chunks_received += 1
+                yield line
+        except Exception as e:
+            verbose_proxy_logger.debug(f"Error during line iteration: {e}")
+            raise
+        finally:
+            self.close()
+    
+    def aiter_lines(self):
+        """Asynchronous line iteration"""
+        return self._aiter_lines_wrapper()
+    
+    async def _aiter_lines_wrapper(self):
+        """Async wrapper that properly closes resources and handles retries"""
+        try:
+            async for line in self.response.aiter_lines():
+                self.chunks_received += 1
+                yield line
+        except Exception as e:
+            error_msg = str(e).lower()
+            error_type = type(e).__name__
+            
+            verbose_proxy_logger.debug(f"🔍 Stream error occurred: {error_type}: {e}")
+            verbose_proxy_logger.debug(f"🔍 Error message: {error_msg}")
+            verbose_proxy_logger.debug(f"🔍 Chunks received: {self.chunks_received}")
+            verbose_proxy_logger.debug(f"🔍 Retry attempted: {self.retry_attempted}")
+            verbose_proxy_logger.debug(f"🔍 Custom LLM provider: {self.custom_llm_provider}")
+            
+            # Check if this is a connection error that we can retry
+            is_connection_error = any(conn_error in error_msg for conn_error in [
+                "readerror", "connecterror", "connection", "timeout", "network", 
+                "unreachable", "refused", "reset", "broken", "failed to establish",
+                "streamclosed", "stream closed", "read", "write", "socket"
+            ]) or error_type.lower() in ["readerror", "connecterror", "httperror"]
+            
+            verbose_proxy_logger.debug(f"🔍 Is connection error: {is_connection_error}")
+            
+            # More aggressive retry conditions: retry if not attempted and received fewer than 20 chunks
+            should_retry = (
+                is_connection_error and 
+                not self.retry_attempted and 
+                self.chunks_received < 20 and
+                self.custom_llm_provider and
+                self.api_base
+            )
+            
+            verbose_proxy_logger.debug(f"🔍 Should retry: {should_retry}")
+            
+            if should_retry:
+                verbose_proxy_logger.info(f"🔌 Stream connection error detected, attempting retry with different proxy")
+                
+                # Try to retry with a different proxy
+                try:
+                    new_response = await self._retry_with_different_proxy()
+                    if new_response:
+                        verbose_proxy_logger.info(f"✅ Successfully retried stream with different proxy")
+                        # Continue streaming from the new response
+                        async for line in new_response.aiter_lines():
+                            yield line
+                        return
+                    else:
+                        verbose_proxy_logger.warning(f"❌ Retry returned None - no new response available")
+                except Exception as retry_error:
+                    verbose_proxy_logger.warning(f"❌ Retry with different proxy failed: {retry_error}")
+                    import traceback
+                    verbose_proxy_logger.debug(f"❌ Retry traceback: {traceback.format_exc()}")
+            else:
+                verbose_proxy_logger.debug(f"🚫 Not retrying stream error - conditions not met")
+            
+            verbose_proxy_logger.debug(f"Re-raising original error: {e}")
+            raise
+        finally:
+            await self.aclose()
+    
+    async def _retry_with_different_proxy(self):
+        """Try to create a new stream with a different proxy"""
+        if self.retry_attempted:
+            verbose_proxy_logger.error(f"❌ Retry already attempted, cannot retry again")
+            return None
+            
+        self.retry_attempted = True
+        
+        try:
+            from litellm.proxy.proxy_config import global_proxy_config
+            from litellm.llms.custom_httpx.http_handler import get_simple_async_httpx_client
+            
+            verbose_proxy_logger.info(f"🔄 Starting retry process for {self.custom_llm_provider}")
+            
+            # Get next available proxy
+            proxy_config = await global_proxy_config.get_next_available_proxy_dynamic(
+                custom_llm_provider=self.custom_llm_provider,
+                prisma_client=None
+            )
+            
+            if not proxy_config:
+                verbose_proxy_logger.error(f"💀 No more proxies available for retry")
+                return None
+            
+            verbose_proxy_logger.info(f"🔄 Retrying with new proxy: {proxy_config}")
+            
+            # Validate required parameters
+            if not self.api_base:
+                verbose_proxy_logger.error(f"❌ Missing api_base for retry")
+                return None
+                
+            if not self.headers:
+                verbose_proxy_logger.warning(f"⚠️ Missing headers for retry, using empty dict")
+                self.headers = {}
+                
+            if not self.data and not self.signed_json_body:
+                verbose_proxy_logger.error(f"❌ Missing both data and signed_json_body for retry")
+                return None
+            
+            # Convert proxy config to httpx format
+            httpx_proxy_config = {}
+            if proxy_config and isinstance(proxy_config, dict):
+                if proxy_config.get('http'):
+                    httpx_proxy_config['http://'] = proxy_config['http']
+                if proxy_config.get('https'):
+                    httpx_proxy_config['https://'] = proxy_config['https']
+            
+            verbose_proxy_logger.info(f"🔄 Creating new client with proxy config: {httpx_proxy_config}")
+            
+            # Create new client with different proxy
+            new_proxy_client = get_simple_async_httpx_client(
+                llm_provider=self.custom_llm_provider,
+                params={"proxy": httpx_proxy_config} if httpx_proxy_config else None
+            )
+            
+            verbose_proxy_logger.info(f"🔄 Creating new stream request to {self.api_base}")
+            
+            # Create new stream
+            new_stream_response = new_proxy_client.stream(
+                method="POST",
+                url=self.api_base,
+                headers=self.headers,
+                content=(
+                    self.signed_json_body
+                    if self.signed_json_body is not None
+                    else json.dumps(self.data)
+                ),
+                timeout=self.timeout,
+            )
+            
+            verbose_proxy_logger.info(f"🔄 Entering stream context")
+            
+            # Get the response object
+            new_response = await new_stream_response.__aenter__()
+            new_response.raise_for_status()
+            
+            verbose_proxy_logger.info(f"🔄 New stream response status: {new_response.status_code}")
+            
+            # Close the old connection first
+            await self.aclose()
+            
+            # Replace with new connection
+            self.response = new_response
+            self.stream_context = new_stream_response
+            self.proxy_client = new_proxy_client
+            self._closed = False
+            
+            verbose_proxy_logger.info(f"✅ Successfully created new stream with different proxy")
+            return new_response
+            
+        except Exception as e:
+            verbose_proxy_logger.error(f"❌ Failed to retry with different proxy: {e}")
+            import traceback
+            verbose_proxy_logger.error(f"❌ Retry exception traceback: {traceback.format_exc()}")
+            return None
+    
+    def close(self):
+        """Close the stream and client (sync)"""
+        if not self._closed:
+            try:
+                if hasattr(self.stream_context, '__exit__'):
+                    self.stream_context.__exit__(None, None, None)
+            except Exception as e:
+                verbose_proxy_logger.debug(f"Error closing stream context: {e}")
+            
+            try:
+                if hasattr(self.proxy_client, 'close'):
+                    self.proxy_client.close()
+            except Exception as e:
+                verbose_proxy_logger.debug(f"Error closing proxy client: {e}")
+            
+            self._closed = True
+    
+    async def aclose(self):
+        """Close the stream and client (async)"""
+        if not self._closed:
+            try:
+                if hasattr(self.stream_context, '__aexit__'):
+                    await self.stream_context.__aexit__(None, None, None)
+            except Exception as e:
+                verbose_proxy_logger.debug(f"Error closing async stream context: {e}")
+            
+            try:
+                if hasattr(self.proxy_client, 'aclose'):
+                    await self.proxy_client.aclose()
+            except Exception as e:
+                verbose_proxy_logger.debug(f"Error closing async proxy client: {e}")
+            
+            self._closed = True
+
+
 class BaseLLMHTTPHandler:
     async def _make_common_async_call(
         self,
@@ -89,11 +329,138 @@ class BaseLLMHTTPHandler:
         signed_json_body: Optional[bytes] = None,
     ) -> httpx.Response:
         """Common implementation across stream + non-stream calls. Meant to ensure consistent error-handling."""
+        from litellm._logging import verbose_proxy_logger
+        
         max_retry_on_unprocessable_entity_error = (
             provider_config.max_retry_on_unprocessable_entity_error
         )
 
         response: Optional[httpx.Response] = None
+        
+        # Check if this is a multi-proxy configuration
+        custom_llm_provider = litellm_params.get("custom_llm_provider")
+        multi_proxy_config = None
+        try:
+            from litellm.proxy.proxy_config import global_proxy_config
+            from litellm.proxy.multi_proxy_handler import multi_proxy_handler
+            
+            # Use dynamic configuration loading
+            multi_proxy_config = await global_proxy_config.get_multi_proxy_config_dynamic(
+                custom_llm_provider=custom_llm_provider
+            )
+            
+            if multi_proxy_config:
+                verbose_proxy_logger.info(f"🔄 Multi-proxy configuration detected for {custom_llm_provider}")
+                
+                async def make_request_with_proxy(proxy_config):
+                    """Make request with specific proxy configuration"""
+                    verbose_proxy_logger.info(f"🎯 Attempting async request with proxy: {proxy_config}")
+                    
+                    # Create new client with specific proxy
+                    from litellm.llms.custom_httpx.http_handler import get_simple_async_httpx_client
+                    
+                    # Convert proxy config to httpx format
+                    httpx_proxy_config = {}
+                    if proxy_config and isinstance(proxy_config, dict):
+                        if proxy_config.get('http'):
+                            httpx_proxy_config['http://'] = proxy_config['http']
+                        if proxy_config.get('https'):
+                            httpx_proxy_config['https://'] = proxy_config['https']
+                    
+                    proxy_client = get_simple_async_httpx_client(
+                        llm_provider=custom_llm_provider,
+                        params={"proxy": httpx_proxy_config} if httpx_proxy_config else None
+                    )
+                    
+                    try:
+                        verbose_proxy_logger.info(f"📤 Sending request to {api_base} via proxy")
+                        # For httpx.AsyncClient, we need to use the stream context manager instead of stream parameter
+                        if stream:
+                            # For streaming requests, we need to handle the stream lifecycle properly
+                            # Use async with for the stream context manager
+                            stream_response = proxy_client.stream(
+                                method="POST",
+                                url=api_base,
+                                headers=headers,
+                                content=(
+                                    signed_json_body
+                                    if signed_json_body is not None
+                                    else json.dumps(data)
+                                ),
+                                timeout=timeout,
+                            )
+                            
+                            # Check status and handle errors
+                            try:
+                                # Get the response object (this starts the stream)
+                                response = await stream_response.__aenter__()
+                                response.raise_for_status()
+                                verbose_proxy_logger.info(f"✅ Multi-proxy streaming request successful via proxy: {proxy_config}")
+                                
+                                # Return the wrapped stream response with proper lifecycle management
+                                return MultiProxyStreamResponse(
+                                    response=response,
+                                    stream_context=stream_response,
+                                    proxy_client=proxy_client,
+                                    api_base=api_base,
+                                    headers=headers,
+                                    data=data,
+                                    signed_json_body=signed_json_body,
+                                    timeout=timeout,
+                                    custom_llm_provider=custom_llm_provider
+                                )
+                                
+                            except Exception as status_error:
+                                # Close the stream if there's a status error
+                                try:
+                                    await stream_response.__aexit__(None, None, None)
+                                except:
+                                    pass
+                                await proxy_client.aclose()
+                                raise status_error
+                        else:
+                            # For non-streaming requests, use regular post
+                            response = await proxy_client.post(
+                                url=api_base,
+                                headers=headers,
+                                content=(
+                                    signed_json_body
+                                    if signed_json_body is not None
+                                    else json.dumps(data)
+                                ),
+                                timeout=timeout,
+                            )
+                            verbose_proxy_logger.info(f"✅ Request successful via proxy: {proxy_config}")
+                            return response
+                        
+                    except Exception as e:
+                        error_msg = str(e).lower()
+                        if any(conn_error in error_msg for conn_error in [
+                            "connection", "timeout", "network", "unreachable", 
+                            "refused", "reset", "broken", "failed to establish"
+                        ]):
+                            verbose_proxy_logger.warning(f"🔌 Proxy connection failed: {proxy_config} - {e}")
+                            raise  # Re-raise to trigger retry with next proxy
+                        else:
+                            verbose_proxy_logger.error(f"❌ Non-connection error with proxy {proxy_config}: {e}")
+                            raise  # Re-raise non-connection errors
+                    finally:
+                        await proxy_client.aclose()
+                
+                # Execute with multi-proxy retry
+                response = await multi_proxy_handler.execute_with_proxy_retry(
+                    func=make_request_with_proxy,
+                    custom_llm_provider=custom_llm_provider
+                )
+                
+                if response is not None:
+                    return response
+                    
+        except Exception as e:
+            verbose_proxy_logger.error(f"❌ Multi-proxy request failed: {e}")
+            # Fall through to regular request
+        
+        # Regular single-proxy or no-proxy handling
         for i in range(max(max_retry_on_unprocessable_entity_error, 1)):
             try:
                 response = await async_httpx_client.post(
@@ -153,7 +520,143 @@ class BaseLLMHTTPHandler:
         )
 
         response: Optional[httpx.Response] = None
-
+        
+        # Check if this is a multi-proxy configuration
+        custom_llm_provider = litellm_params.get("custom_llm_provider")
+        multi_proxy_config = None
+        try:
+            from litellm.proxy.proxy_config import global_proxy_config
+            from litellm.proxy.multi_proxy_handler import multi_proxy_handler
+            
+            # Use dynamic configuration loading (sync version needs async wrapper)
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+                multi_proxy_config = loop.run_until_complete(
+                    global_proxy_config.get_multi_proxy_config_dynamic(
+                        custom_llm_provider=custom_llm_provider
+                    )
+                )
+            except RuntimeError:
+                # No event loop running, create one
+                multi_proxy_config = asyncio.run(
+                    global_proxy_config.get_multi_proxy_config_dynamic(
+                        custom_llm_provider=custom_llm_provider
+                    )
+                )
+            
+            if multi_proxy_config:
+                verbose_proxy_logger.info(f"🔄 Multi-proxy configuration detected for {custom_llm_provider}")
+                
+                def make_request_with_proxy(proxy_config):
+                    """Make request with specific proxy configuration"""
+                    verbose_proxy_logger.info(f"🎯 Attempting sync request with proxy: {proxy_config}")
+                    
+                    # Create new client with specific proxy
+                    from litellm.llms.custom_httpx.http_handler import get_simple_sync_httpx_client
+                    
+                    # Convert proxy config to httpx format
+                    httpx_proxy_config = {}
+                    if proxy_config and isinstance(proxy_config, dict):
+                        if proxy_config.get('http'):
+                            httpx_proxy_config['http://'] = proxy_config['http']
+                        if proxy_config.get('https'):
+                            httpx_proxy_config['https://'] = proxy_config['https']
+                    
+                    proxy_client = get_simple_sync_httpx_client(
+                        llm_provider=custom_llm_provider,
+                        params={"proxy": httpx_proxy_config} if httpx_proxy_config else None
+                    )
+                    
+                    try:
+                        verbose_proxy_logger.info(f"📤 Sending sync request to {api_base} via proxy")
+                        
+                        # For httpx.Client (sync), use stream context manager for streaming requests
+                        if stream:
+                            # For streaming, use stream context manager for raw httpx.Client
+                            stream_response = proxy_client.stream(
+                                method="POST",
+                                url=api_base,
+                                headers=headers,
+                                content=(
+                                    signed_json_body
+                                    if signed_json_body is not None
+                                    else json.dumps(data)
+                                ),
+                                timeout=timeout,
+                            )
+                            
+                            try:
+                                # Get the response object (this starts the stream)
+                                response = stream_response.__enter__()
+                                response.raise_for_status()
+                                verbose_proxy_logger.info(f"✅ Sync streaming request successful via proxy: {proxy_config}")
+                                
+                                # Return the wrapped stream response with proper lifecycle management
+                                return MultiProxyStreamResponse(
+                                    response=response,
+                                    stream_context=stream_response,
+                                    proxy_client=proxy_client,
+                                    api_base=api_base,
+                                    headers=headers,
+                                    data=data,
+                                    signed_json_body=signed_json_body,
+                                    timeout=timeout,
+                                    custom_llm_provider=custom_llm_provider
+                                )
+                                
+                            except Exception as status_error:
+                                # Close the stream if there's a status error
+                                try:
+                                    stream_response.__exit__(None, None, None)
+                                except:
+                                    pass
+                                proxy_client.close()
+                                raise status_error
+                        else:
+                            # For non-streaming requests, use regular post
+                            response = proxy_client.post(
+                                url=api_base,
+                                headers=headers,
+                                content=(
+                                    signed_json_body
+                                    if signed_json_body is not None
+                                    else json.dumps(data)
+                                ),
+                                timeout=timeout,
+                            )
+                            verbose_proxy_logger.info(f"✅ Sync request successful via proxy: {proxy_config}")
+                            return response
+                        
+                    except Exception as e:
+                        error_msg = str(e).lower()
+                        if any(conn_error in error_msg for conn_error in [
+                            "connection", "timeout", "network", "unreachable", 
+                            "refused", "reset", "broken", "failed to establish"
+                        ]):
+                            verbose_proxy_logger.warning(f"🔌 Sync proxy connection failed: {proxy_config} - {e}")
+                            raise  # Re-raise to trigger retry with next proxy
+                        else:
+                            verbose_proxy_logger.error(f"❌ Non-connection error with sync proxy {proxy_config}: {e}")
+                            raise  # Re-raise non-connection errors
+                    finally:
+                        proxy_client.close()
+                
+                # Execute with multi-proxy retry (sync version)
+                response = multi_proxy_handler.execute_with_proxy_retry_sync(
+                    func=make_request_with_proxy,
+                    custom_llm_provider=custom_llm_provider,
+                    proxy_config=multi_proxy_config
+                )
+                
+                if response is not None:
+                    return response
+                    
+        except Exception as e:
+            verbose_proxy_logger.error(f"❌ Sync multi-proxy request failed: {e}")
+            # Fall through to regular request
+        
+        # Regular single-proxy or no-proxy handling
         for i in range(max(max_retry_on_unprocessable_entity_error, 1)):
             try:
                 response = sync_httpx_client.post(
@@ -539,9 +1042,7 @@ class BaseLLMHTTPHandler:
             )
         else:
             completion_stream = provider_config.get_model_response_iterator(
-                streaming_response=response.iter_lines(),
-                sync_stream=True,
-                json_mode=json_mode,
+                streaming_response=response.iter_lines(), sync_stream=True, json_mode=json_mode,
             )
 
         # LOGGING
