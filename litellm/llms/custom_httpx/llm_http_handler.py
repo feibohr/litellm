@@ -97,9 +97,11 @@ class MultiProxyStreamResponse:
         self.timeout = timeout
         self.custom_llm_provider = custom_llm_provider
         
-        # Track retry state
+        # Track retry state and preserved data
         self.retry_attempted = False
         self.chunks_received = 0
+        self.preserved_lines = []  # Store lines received before retry
+        self.preserved_usage = None  # Store usage info if found before retry
     
     def __getattr__(self, name):
         # Delegate attribute access to the wrapped response
@@ -108,8 +110,15 @@ class MultiProxyStreamResponse:
     def iter_lines(self):
         """Synchronous line iteration"""
         try:
+            # First yield any preserved lines from before retry
+            for preserved_line in self.preserved_lines:
+                yield preserved_line
+            
             for line in self.response.iter_lines():
                 self.chunks_received += 1
+                # Store line in case we need to retry later
+                if len(self.preserved_lines) < 50:  # Limit memory usage
+                    self.preserved_lines.append(line)
                 yield line
         except Exception as e:
             verbose_proxy_logger.debug(f"Error during line iteration: {e}")
@@ -124,9 +133,36 @@ class MultiProxyStreamResponse:
     async def _aiter_lines_wrapper(self):
         """Async wrapper that properly closes resources and handles retries"""
         try:
+            # First yield any preserved lines from before retry
+            for preserved_line in self.preserved_lines:
+                yield preserved_line
+            
             async for line in self.response.aiter_lines():
                 self.chunks_received += 1
+                
+                # Store line in case we need to retry later (limit memory usage)
+                if len(self.preserved_lines) < 50:
+                    self.preserved_lines.append(line)
+                
+                # Check if this line contains usage information and preserve it
+                if line and not self.preserved_usage:
+                    try:
+                        import json
+                        # Try to parse the line as JSON to check for usage
+                        line_str = line.decode('utf-8') if isinstance(line, bytes) else line
+                        if line_str.startswith('data: '):
+                            json_str = line_str[6:]  # Remove 'data: ' prefix
+                            if json_str.strip() and json_str.strip() != '[DONE]':
+                                chunk_data = json.loads(json_str)
+                                if isinstance(chunk_data, dict) and 'usage' in chunk_data:
+                                    self.preserved_usage = chunk_data['usage']
+                                    verbose_proxy_logger.debug(f"📊 Preserved usage info: {self.preserved_usage}")
+                    except Exception:
+                        # Ignore JSON parsing errors - not all lines are JSON
+                        pass
+                
                 yield line
+                
         except Exception as e:
             error_msg = str(e).lower()
             error_type = type(e).__name__
@@ -136,6 +172,8 @@ class MultiProxyStreamResponse:
             verbose_proxy_logger.debug(f"🔍 Chunks received: {self.chunks_received}")
             verbose_proxy_logger.debug(f"🔍 Retry attempted: {self.retry_attempted}")
             verbose_proxy_logger.debug(f"🔍 Custom LLM provider: {self.custom_llm_provider}")
+            verbose_proxy_logger.debug(f"🔍 Preserved lines count: {len(self.preserved_lines)}")
+            verbose_proxy_logger.debug(f"🔍 Preserved usage: {self.preserved_usage}")
             
             # Check if this is a connection error that we can retry
             is_connection_error = any(conn_error in error_msg for conn_error in [
@@ -165,8 +203,44 @@ class MultiProxyStreamResponse:
                     new_response = await self._retry_with_different_proxy()
                     if new_response:
                         verbose_proxy_logger.info(f"✅ Successfully retried stream with different proxy")
+                        
                         # Continue streaming from the new response
+                        # Note: preserved_lines were already yielded at the start
+                        usage_injected = False
                         async for line in new_response.aiter_lines():
+                            self.chunks_received += 1
+                            
+                            # Check if this is the final chunk and inject preserved usage if needed
+                            if not usage_injected and self.preserved_usage:
+                                try:
+                                    import json
+                                    line_str = line.decode('utf-8') if isinstance(line, bytes) else line
+                                    if line_str.startswith('data: '):
+                                        json_str = line_str[6:]
+                                        if json_str.strip() and json_str.strip() != '[DONE]':
+                                            chunk_data = json.loads(json_str)
+                                            if isinstance(chunk_data, dict):
+                                                # Check if this chunk has finish_reason (likely the final chunk)
+                                                if (chunk_data.get('choices') and 
+                                                    len(chunk_data['choices']) > 0 and
+                                                    chunk_data['choices'][0].get('finish_reason')):
+                                                    
+                                                    # Inject preserved usage into this chunk
+                                                    if 'usage' not in chunk_data:
+                                                        chunk_data['usage'] = self.preserved_usage
+                                                        verbose_proxy_logger.info(f"💉 Injected preserved usage into final chunk: {self.preserved_usage}")
+                                                        
+                                                        # Reconstruct the line with usage
+                                                        new_json_str = json.dumps(chunk_data)
+                                                        new_line = f'data: {new_json_str}'
+                                                        if isinstance(line, bytes):
+                                                            line = new_line.encode('utf-8')
+                                                        else:
+                                                            line = new_line
+                                                        usage_injected = True
+                                except Exception as inject_error:
+                                    verbose_proxy_logger.debug(f"🔧 Usage injection failed: {inject_error}")
+                            
                             yield line
                         return
                     else:

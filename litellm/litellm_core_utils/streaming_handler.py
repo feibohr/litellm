@@ -1585,26 +1585,8 @@ class CustomStreamWrapper:
                     # HANDLE STREAM OPTIONS
                     self.chunks.append(response)
                     
-                    # Check if this should be the final chunk with usage
-                    should_add_usage = False
-                    if hasattr(response, "usage"):
-                        # Remove usage from intermediate chunks, but remember we had it
-                        obj_dict = response.dict()
-                        if "usage" in obj_dict:
-                            del obj_dict["usage"]
-                        response = self.model_response_creator(chunk=obj_dict)
-                    
-                    # Check if this is the final chunk (has finish_reason)
-                    if (response.choices and len(response.choices) > 0 and 
-                        response.choices[0].finish_reason is not None):
-                        should_add_usage = True
-                    
-                    # Add usage to final chunk
-                    if should_add_usage and self.send_stream_usage:
-                        usage = calculate_total_usage(chunks=self.chunks)
-                        response._hidden_params["usage"] = usage
-                        response.usage = usage
-                        
+                    # For OpenRouter and similar providers, preserve usage information
+                    # Don't remove usage from chunks anymore - it's needed for final calculation
                     print_verbose(f"final returned processed chunk: {response}")
                     return response
 
@@ -1659,69 +1641,6 @@ class CustomStreamWrapper:
                     cache_hit,
                 )  # log response
                 return processed_chunk
-        except Exception as e:
-            traceback_exception = traceback.format_exc()
-            
-            # Check if this is a stream closed error that might be retryable with multi-proxy
-            if "streamclosed" in str(e).lower() or "stream closed" in str(e).lower():
-                verbose_proxy_logger.warning(f"🔌 Stream connection closed: {e}")
-                
-                # Check if multi-proxy configuration is available
-                try:
-                    from litellm.proxy.proxy_config import global_proxy_config
-                    
-                    # Try to get multi-proxy config
-                    multi_proxy_config = None
-                    if hasattr(self, 'custom_llm_provider') and self.custom_llm_provider:
-                        try:
-                            loop = asyncio.get_event_loop()
-                            multi_proxy_config = loop.run_until_complete(
-                                global_proxy_config.get_multi_proxy_config_dynamic(
-                                    custom_llm_provider=self.custom_llm_provider
-                                )
-                            )
-                        except Exception:
-                            pass
-                    
-                    if multi_proxy_config:
-                        verbose_proxy_logger.info(f"💡 Multi-proxy available for retry - converting to connection error")
-                        # Convert to a connection error that will be handled by the retry mechanism
-                        from litellm.exceptions import APIConnectionError
-                        raise APIConnectionError(
-                            message=f"Stream connection closed - retryable with multi-proxy: {str(e)}",
-                            llm_provider=self.custom_llm_provider,
-                            model=self.model
-                        )
-                    else:
-                        verbose_proxy_logger.debug(f"No multi-proxy config available for {self.custom_llm_provider}")
-                        
-                except ImportError:
-                    verbose_proxy_logger.debug("Multi-proxy handler not available")
-                except Exception as proxy_error:
-                    verbose_proxy_logger.debug(f"Error checking multi-proxy config: {proxy_error}")
-            
-            if self.logging_obj is not None:
-                ## LOGGING
-                threading.Thread(
-                    target=self.logging_obj.failure_handler,
-                    args=(e, traceback_exception),
-                ).start()  # log response
-                # Handle any exceptions that might occur during streaming
-                try:
-                    asyncio.create_task(
-                        self.logging_obj.async_failure_handler(e, traceback_exception)
-                    )
-                except Exception:
-                    # If async logging fails, continue without it
-                    pass
-            ## Map to OpenAI Exception
-            raise exception_type(
-                model=self.model,
-                custom_llm_provider=self.custom_llm_provider,
-                original_exception=e,
-                completion_kwargs={},
-                extra_kwargs={},
-            )
 
     def fetch_sync_stream(self):
         if self.completion_stream is None and self.make_call is not None:
@@ -1793,26 +1712,8 @@ class CustomStreamWrapper:
                     )
                     self.chunks.append(processed_chunk)
                     
-                    # Check if this should be the final chunk with usage
-                    should_add_usage = False
-                    if hasattr(processed_chunk, "usage"):
-                        # Remove usage from intermediate chunks, but remember we had it
-                        obj_dict = processed_chunk.dict()
-                        if "usage" in obj_dict:
-                            del obj_dict["usage"]
-                        processed_chunk = self.model_response_creator(chunk=obj_dict)
-                    
-                    # Check if this is the final chunk (has finish_reason)
-                    if (processed_chunk.choices and len(processed_chunk.choices) > 0 and 
-                        processed_chunk.choices[0].finish_reason is not None):
-                        should_add_usage = True
-                    
-                    # Add usage to final chunk
-                    if should_add_usage and self.send_stream_usage:
-                        usage = calculate_total_usage(chunks=self.chunks)
-                        processed_chunk._hidden_params["usage"] = usage
-                        processed_chunk.usage = usage
-                        
+                    # For OpenRouter and similar providers, preserve usage information
+                    # Don't remove usage from chunks anymore - it's needed for final calculation
                     print_verbose(f"final returned processed chunk: {processed_chunk}")
                     return processed_chunk
                 raise StopAsyncIteration
@@ -2041,45 +1942,76 @@ def calculate_total_usage(chunks: List[ModelResponse]) -> Usage:
             if chunk.usage.completion_tokens and chunk.usage.completion_tokens > 0:
                 completion_tokens = chunk.usage.completion_tokens
     
-    # If no usage found in chunks, try to calculate from content
+    # If no usage found in chunks, try to calculate from content and logprobs
     if prompt_tokens == 0 or completion_tokens == 0:
         try:
             # Try to extract content from chunks
             combined_content = ""
+            logprobs_token_count = 0
+            has_logprobs = False
+            
             for chunk in chunks:
                 if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
                     choice = chunk.choices[0]
+                    
+                    # Get content
                     if hasattr(choice, 'delta') and choice.delta and choice.delta.content:
                         combined_content += choice.delta.content
+                    
+                    # Count tokens from logprobs if available (more accurate)
+                    if hasattr(choice, 'logprobs') and choice.logprobs:
+                        has_logprobs = True
+                        if hasattr(choice.logprobs, 'content') and choice.logprobs.content:
+                            # OpenAI-style logprobs
+                            logprobs_token_count += len(choice.logprobs.content)
+                        elif hasattr(choice.logprobs, 'tokens') and choice.logprobs.tokens:
+                            # Alternative logprobs format
+                            logprobs_token_count += len(choice.logprobs.tokens)
             
             # Get model name from first chunk
             model_name = getattr(chunks[0], 'model', 'gpt-3.5-turbo') if chunks else 'gpt-3.5-turbo'
             
-            # Count completion tokens from content
-            if completion_tokens == 0 and combined_content:
-                try:
-                    import litellm
-                    completion_tokens = litellm.token_counter(
-                        model=model_name,
-                        text=combined_content,
-                        count_response_tokens=True
-                    )
-                except Exception:
-                    # Fallback: rough estimate
-                    completion_tokens = max(1, len(combined_content.split()) // 2)
+            # Count completion tokens - prefer logprobs count if available
+            if completion_tokens == 0:
+                if has_logprobs and logprobs_token_count > 0:
+                    completion_tokens = logprobs_token_count
+                    print_verbose(f"🔢 Using logprobs token count: {completion_tokens}")
+                elif combined_content:
+                    try:
+                        import litellm
+                        completion_tokens = litellm.token_counter(
+                            model=model_name,
+                            text=combined_content,
+                            count_response_tokens=True
+                        )
+                        print_verbose(f"🔢 Using token counter: {completion_tokens}")
+                    except Exception:
+                        # Fallback: rough estimate
+                        completion_tokens = max(1, len(combined_content.split()) // 2)
+                        print_verbose(f"🔢 Using word count estimate: {completion_tokens}")
             
             # For prompt tokens, we'd need the original messages
             # For now, set a reasonable fallback if we got completion tokens
             if prompt_tokens == 0 and completion_tokens > 0:
-                prompt_tokens = 1  # At least 1 token for the request
+                # Try to estimate based on model and content length
+                if "gpt-3.5" in model_name or "gpt-4" in model_name:
+                    # GPT models typically have small system prompts
+                    prompt_tokens = max(1, min(10, completion_tokens // 4))
+                else:
+                    # Other models
+                    prompt_tokens = 1  # At least 1 token for the request
+                print_verbose(f"🔢 Estimated prompt tokens: {prompt_tokens}")
                 
-        except Exception:
+        except Exception as e:
+            print_verbose(f"❌ Error in usage calculation: {e}")
             # Ultimate fallback
             if completion_tokens == 0:
                 completion_tokens = 1
             if prompt_tokens == 0:
                 prompt_tokens = 1
 
+    print_verbose(f"📊 Final usage calculation: prompt={prompt_tokens}, completion={completion_tokens}")
+    
     returned_usage_chunk = Usage(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
