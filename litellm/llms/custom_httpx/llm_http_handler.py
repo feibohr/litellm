@@ -441,17 +441,38 @@ class BaseLLMHTTPHandler:
                         if proxy_config.get('https'):
                             httpx_proxy_config['https://'] = proxy_config['https']
                     
+                    # 🎯 记录实际使用的代理配置
+                    actual_http_proxy = httpx_proxy_config.get('http://', 'None')
+                    actual_https_proxy = httpx_proxy_config.get('https://', 'None')
+                    verbose_proxy_logger.info(f"🌐 [MULTI-PROXY] Async HTTP Client | Provider: {custom_llm_provider} | Proxy Config: {httpx_proxy_config}")
+                    
+                    # 🔧 强制传递代理配置参数
                     proxy_client = get_simple_async_httpx_client(
                         llm_provider=custom_llm_provider,
-                        params={"proxy": httpx_proxy_config} if httpx_proxy_config else None
+                        proxies=httpx_proxy_config if httpx_proxy_config else None
                     )
                     
+                    # 🔍 验证代理是否真正设置
+                    client_proxies = getattr(proxy_client, 'proxies', None) if hasattr(proxy_client, 'proxies') else None
+                    if hasattr(proxy_client, '_client'):
+                        client_proxies = getattr(proxy_client._client, 'proxies', None)
+                    
+                    verbose_proxy_logger.info(f"🔍 [PROXY VERIFICATION] Actual async client proxies: {client_proxies}")
+                    print(f"🔍 [PROXY VERIFICATION] Provider: {custom_llm_provider} | Async client proxies: {client_proxies}")
+                    
+                    # 如果客户端没有代理配置，手动创建一个有代理的客户端
+                    if not client_proxies and httpx_proxy_config:
+                        verbose_proxy_logger.warning(f"⚠️ [PROXY FIX] Creating manual async proxy client")
+                        print(f"⚠️ [PROXY FIX] Creating manual async proxy client with: {httpx_proxy_config}")
+                        import httpx
+                        proxy_client = httpx.AsyncClient(proxies=httpx_proxy_config, timeout=timeout)
+                    
                     try:
-                        verbose_proxy_logger.info(f"📤 Sending request to {api_base} via proxy")
-                        # For httpx.AsyncClient, we need to use the stream context manager instead of stream parameter
+                        verbose_proxy_logger.info(f"📤 Sending async request to {api_base} via proxy")
+                        
+                        # For async httpx.AsyncClient, use proper async methods
                         if stream:
-                            # For streaming requests, we need to handle the stream lifecycle properly
-                            # Use async with for the stream context manager
+                            # For streaming, use async stream context manager
                             stream_response = proxy_client.stream(
                                 method="POST",
                                 url=api_base,
@@ -464,12 +485,13 @@ class BaseLLMHTTPHandler:
                                 timeout=timeout,
                             )
                             
-                            # Check status and handle errors
                             try:
                                 # Get the response object (this starts the stream)
                                 response = await stream_response.__aenter__()
                                 response.raise_for_status()
-                                verbose_proxy_logger.info(f"✅ Multi-proxy streaming request successful via proxy: {proxy_config}")
+                                # 🎯 记录实际成功的代理（现在在状态检查之后）
+                                verbose_proxy_logger.info(f"✅ [VPN SUCCESS ASYNC] Provider: {custom_llm_provider} | HTTP Proxy: {actual_http_proxy} | HTTPS Proxy: {actual_https_proxy}")
+                                print(f"✅ [VPN SUCCESS ASYNC] Provider: {custom_llm_provider} | HTTP: {actual_http_proxy} | HTTPS: {actual_https_proxy}")
                                 
                                 # Return the wrapped stream response with proper lifecycle management
                                 return MultiProxyStreamResponse(
@@ -493,7 +515,7 @@ class BaseLLMHTTPHandler:
                                 await proxy_client.aclose()
                                 raise status_error
                         else:
-                            # For non-streaming requests, use regular post
+                            # For non-streaming requests, use regular async post
                             response = await proxy_client.post(
                                 url=api_base,
                                 headers=headers,
@@ -504,7 +526,11 @@ class BaseLLMHTTPHandler:
                                 ),
                                 timeout=timeout,
                             )
-                            verbose_proxy_logger.info(f"✅ Request successful via proxy: {proxy_config}")
+                            # 验证响应状态
+                            response.raise_for_status()
+                            # 🎯 记录实际成功的代理（现在在状态检查之后）
+                            verbose_proxy_logger.info(f"✅ [VPN SUCCESS ASYNC] Provider: {custom_llm_provider} | HTTP Proxy: {actual_http_proxy} | HTTPS Proxy: {actual_https_proxy}")
+                            print(f"✅ [VPN SUCCESS ASYNC] Provider: {custom_llm_provider} | HTTP: {actual_http_proxy} | HTTPS: {actual_https_proxy}")
                             return response
                         
                     except Exception as e:
@@ -513,15 +539,18 @@ class BaseLLMHTTPHandler:
                             "connection", "timeout", "network", "unreachable", 
                             "refused", "reset", "broken", "failed to establish"
                         ]):
-                            verbose_proxy_logger.warning(f"🔌 Proxy connection failed: {proxy_config} - {e}")
+                            # 🎯 记录实际失败的代理
+                            verbose_proxy_logger.warning(f"❌ [VPN FAILED ASYNC] Provider: {custom_llm_provider} | HTTP Proxy: {actual_http_proxy} | HTTPS Proxy: {actual_https_proxy} | Error: {str(e)[:100]}")
+                            print(f"❌ [VPN FAILED ASYNC] Provider: {custom_llm_provider} | HTTP: {actual_http_proxy} | HTTPS: {actual_https_proxy}")
                             raise  # Re-raise to trigger retry with next proxy
                         else:
-                            verbose_proxy_logger.error(f"❌ Non-connection error with proxy {proxy_config}: {e}")
+                            verbose_proxy_logger.error(f"❌ Non-connection error with async proxy {httpx_proxy_config}: {e}")
                             raise  # Re-raise non-connection errors
                     finally:
-                        await proxy_client.aclose()
+                        if hasattr(proxy_client, 'aclose'):
+                            await proxy_client.aclose()
                 
-                # Execute with multi-proxy retry
+                # Execute with multi-proxy retry (async version)
                 response = await multi_proxy_handler.execute_with_proxy_retry(
                     func=make_request_with_proxy,
                     custom_llm_provider=custom_llm_provider
@@ -531,209 +560,18 @@ class BaseLLMHTTPHandler:
                     return response
                     
         except Exception as e:
-            verbose_proxy_logger.error(f"❌ Multi-proxy request failed: {e}")
-            # Fall through to regular request
-        
-        # Regular single-proxy or no-proxy handling
-        for i in range(max(max_retry_on_unprocessable_entity_error, 1)):
-            try:
-                response = await async_httpx_client.post(
-                    url=api_base,
-                    headers=headers,
-                    data=(
-                        signed_json_body
-                        if signed_json_body is not None
-                        else json.dumps(data)
-                    ),
-                    timeout=timeout,
-                    stream=stream,
-                    logging_obj=logging_obj,
-                )
-            except httpx.HTTPStatusError as e:
-                hit_max_retry = i + 1 == max_retry_on_unprocessable_entity_error
-                should_retry = provider_config.should_retry_llm_api_inside_llm_translation_on_http_error(
-                    e=e, litellm_params=litellm_params
-                )
-                if should_retry and not hit_max_retry:
-                    data = (
-                        provider_config.transform_request_on_unprocessable_entity_error(
-                            e=e, request_data=data
-                        )
-                    )
-                    continue
-                else:
-                    raise self._handle_error(e=e, provider_config=provider_config)
-            except Exception as e:
-                raise self._handle_error(e=e, provider_config=provider_config)
-            break
-
-        if response is None:
-            raise provider_config.get_error_class(
-                error_message="No response from the API",
-                status_code=422,  # don't retry on this error
-                headers={},
-            )
-
-        return response
-
-    def _make_common_sync_call(
-        self,
-        sync_httpx_client: HTTPHandler,
-        provider_config: BaseConfig,
-        api_base: str,
-        headers: dict,
-        data: dict,
-        timeout: Union[float, httpx.Timeout],
-        litellm_params: dict,
-        logging_obj: LiteLLMLoggingObj,
-        stream: bool = False,
-        signed_json_body: Optional[bytes] = None,
-    ) -> httpx.Response:
-        max_retry_on_unprocessable_entity_error = (
-            provider_config.max_retry_on_unprocessable_entity_error
-        )
-
-        response: Optional[httpx.Response] = None
-        
-        # Check if this is a multi-proxy configuration
-        custom_llm_provider = litellm_params.get("custom_llm_provider")
-        multi_proxy_config = None
-        try:
-            from litellm.proxy.proxy_config import global_proxy_config
-            from litellm.proxy.multi_proxy_handler import multi_proxy_handler
-            
-            # Use dynamic configuration loading (sync version needs async wrapper)
-            import asyncio
-            try:
-                loop = asyncio.get_event_loop()
-                multi_proxy_config = loop.run_until_complete(
-                    global_proxy_config.get_multi_proxy_config_dynamic(
-                        custom_llm_provider=custom_llm_provider
-                    )
-                )
-            except RuntimeError:
-                # No event loop running, create one
-                multi_proxy_config = asyncio.run(
-                    global_proxy_config.get_multi_proxy_config_dynamic(
-                        custom_llm_provider=custom_llm_provider
-                    )
-                )
-            
-            if multi_proxy_config:
-                verbose_proxy_logger.info(f"🔄 Multi-proxy configuration detected for {custom_llm_provider}")
-                
-                def make_request_with_proxy(proxy_config):
-                    """Make request with specific proxy configuration"""
-                    verbose_proxy_logger.info(f"🎯 Attempting sync request with proxy: {proxy_config}")
-                    
-                    # Create new client with specific proxy
-                    from litellm.llms.custom_httpx.http_handler import get_simple_sync_httpx_client
-                    
-                    # Convert proxy config to httpx format
-                    httpx_proxy_config = {}
-                    if proxy_config and isinstance(proxy_config, dict):
-                        if proxy_config.get('http'):
-                            httpx_proxy_config['http://'] = proxy_config['http']
-                        if proxy_config.get('https'):
-                            httpx_proxy_config['https://'] = proxy_config['https']
-                    
-                    proxy_client = get_simple_sync_httpx_client(
-                        llm_provider=custom_llm_provider,
-                        params={"proxy": httpx_proxy_config} if httpx_proxy_config else None
-                    )
-                    
-                    try:
-                        verbose_proxy_logger.info(f"📤 Sending sync request to {api_base} via proxy")
-                        
-                        # For httpx.Client (sync), use stream context manager for streaming requests
-                        if stream:
-                            # For streaming, use stream context manager for raw httpx.Client
-                            stream_response = proxy_client.stream(
-                                method="POST",
-                                url=api_base,
-                                headers=headers,
-                                content=(
-                                    signed_json_body
-                                    if signed_json_body is not None
-                                    else json.dumps(data)
-                                ),
-                                timeout=timeout,
-                            )
-                            
-                            try:
-                                # Get the response object (this starts the stream)
-                                response = stream_response.__enter__()
-                                response.raise_for_status()
-                                verbose_proxy_logger.info(f"✅ Sync streaming request successful via proxy: {proxy_config}")
-                                
-                                # Return the wrapped stream response with proper lifecycle management
-                                return MultiProxyStreamResponse(
-                                    response=response,
-                                    stream_context=stream_response,
-                                    proxy_client=proxy_client,
-                                    api_base=api_base,
-                                    headers=headers,
-                                    data=data,
-                                    signed_json_body=signed_json_body,
-                                    timeout=timeout,
-                                    custom_llm_provider=custom_llm_provider
-                                )
-                                
-                            except Exception as status_error:
-                                # Close the stream if there's a status error
-                                try:
-                                    stream_response.__exit__(None, None, None)
-                                except:
-                                    pass
-                                proxy_client.close()
-                                raise status_error
-                        else:
-                            # For non-streaming requests, use regular post
-                            response = proxy_client.post(
-                                url=api_base,
-                                headers=headers,
-                                content=(
-                                    signed_json_body
-                                    if signed_json_body is not None
-                                    else json.dumps(data)
-                                ),
-                                timeout=timeout,
-                            )
-                            verbose_proxy_logger.info(f"✅ Sync request successful via proxy: {proxy_config}")
-                            return response
-                        
-                    except Exception as e:
-                        error_msg = str(e).lower()
-                        if any(conn_error in error_msg for conn_error in [
-                            "connection", "timeout", "network", "unreachable", 
-                            "refused", "reset", "broken", "failed to establish"
-                        ]):
-                            verbose_proxy_logger.warning(f"🔌 Sync proxy connection failed: {proxy_config} - {e}")
-                            raise  # Re-raise to trigger retry with next proxy
-                        else:
-                            verbose_proxy_logger.error(f"❌ Non-connection error with sync proxy {proxy_config}: {e}")
-                            raise  # Re-raise non-connection errors
-                    finally:
-                        proxy_client.close()
-                
-                # Execute with multi-proxy retry (sync version)
-                response = multi_proxy_handler.execute_with_proxy_retry_sync(
-                    func=make_request_with_proxy,
-                    custom_llm_provider=custom_llm_provider,
-                    proxy_config=multi_proxy_config
-                )
-                
-                if response is not None:
-                    return response
-                    
-        except Exception as e:
             verbose_proxy_logger.error(f"❌ Sync multi-proxy request failed: {e}")
+            verbose_proxy_logger.warning(f"🔄 [PROXY FALLBACK] All proxy configurations failed for {custom_llm_provider}, falling back to direct connection")
+            print(f"🔄 [PROXY FALLBACK] Provider: {custom_llm_provider} | Reason: All proxies failed | Action: Using direct connection")
             # Fall through to regular request
         
         # Regular single-proxy or no-proxy handling
+        verbose_proxy_logger.info(f"🌐 [DIRECT CONNECTION] Provider: {custom_llm_provider} | Using direct connection (no VPN)")
+        print(f"🌐 [DIRECT CONNECTION] Provider: {custom_llm_provider} | No VPN - using direct connection")
+        
         for i in range(max(max_retry_on_unprocessable_entity_error, 1)):
             try:
-                response = sync_httpx_client.post(
+                response = async_httpx_client.post(
                     url=api_base,
                     headers=headers,
                     data=(
@@ -745,6 +583,9 @@ class BaseLLMHTTPHandler:
                     stream=stream,
                     logging_obj=logging_obj,
                 )
+                verbose_proxy_logger.info(f"✅ [DIRECT SUCCESS] Provider: {custom_llm_provider} | Direct connection successful")
+                print(f"✅ [DIRECT SUCCESS] Provider: {custom_llm_provider} | Direct connection successful")
+                break
             except httpx.HTTPStatusError as e:
                 hit_max_retry = i + 1 == max_retry_on_unprocessable_entity_error
                 should_retry = provider_config.should_retry_llm_api_inside_llm_translation_on_http_error(
@@ -760,8 +601,9 @@ class BaseLLMHTTPHandler:
                 else:
                     raise self._handle_error(e=e, provider_config=provider_config)
             except Exception as e:
+                verbose_proxy_logger.error(f"❌ [DIRECT FAILED] Provider: {custom_llm_provider} | Direct connection failed: {str(e)[:100]}...")
+                print(f"❌ [DIRECT FAILED] Provider: {custom_llm_provider} | Direct connection failed: {str(e)[:100]}...")
                 raise self._handle_error(e=e, provider_config=provider_config)
-            break
 
         if response is None:
             raise provider_config.get_error_class(
@@ -1054,6 +896,186 @@ class BaseLLMHTTPHandler:
             encoding=encoding,
             json_mode=json_mode,
         )
+
+    def _make_common_sync_call(
+        self,
+        sync_httpx_client: HTTPHandler,
+        provider_config: BaseConfig,
+        api_base: str,
+        headers: dict,
+        data: dict,
+        timeout: Union[float, httpx.Timeout],
+        litellm_params: dict,
+        logging_obj: LiteLLMLoggingObj,
+        stream: bool = False,
+        signed_json_body: Optional[bytes] = None,
+    ) -> httpx.Response:
+        import asyncio
+        max_retry_on_unprocessable_entity_error = (
+            provider_config.max_retry_on_unprocessable_entity_error
+        )
+
+        response: Optional[httpx.Response] = None
+        
+        # Check if this is a multi-proxy configuration
+        custom_llm_provider = litellm_params.get("custom_llm_provider")
+        multi_proxy_config = None
+        try:
+            from litellm.proxy.proxy_config import global_proxy_config
+            from litellm.proxy.multi_proxy_handler import multi_proxy_handler
+            
+            # 🔧 修复asyncio事件循环问题 - 使用更安全的方法
+            try:
+                # 尝试获取当前事件循环
+                loop = asyncio.get_running_loop()
+                # 如果有运行中的事件循环，回退到同步方法
+                verbose_proxy_logger.debug(f"Running event loop detected, using sync proxy config method")
+                multi_proxy_config = global_proxy_config.get_multi_proxy_config(
+                    custom_llm_provider=custom_llm_provider
+                )
+            except RuntimeError:
+                # 没有运行中的事件循环，可以使用 asyncio.run
+                verbose_proxy_logger.debug(f"No running event loop, using asyncio.run")
+                multi_proxy_config = asyncio.run(
+                    global_proxy_config.get_multi_proxy_config_dynamic(
+                        custom_llm_provider=custom_llm_provider
+                    )
+                )
+            
+            if multi_proxy_config:
+                verbose_proxy_logger.info(f"🔄 Multi-proxy configuration detected for {custom_llm_provider}")
+                
+                def make_request_with_proxy(proxy_config):
+                    """Make request with specific proxy configuration"""
+                    verbose_proxy_logger.info(f"🎯 Attempting sync request with proxy: {proxy_config}")
+                    
+                    # Convert proxy config to httpx format
+                    httpx_proxy_config = {}
+                    if proxy_config and isinstance(proxy_config, dict):
+                        if proxy_config.get('http'):
+                            httpx_proxy_config['http://'] = proxy_config['http']
+                        if proxy_config.get('https'):
+                            httpx_proxy_config['https://'] = proxy_config['https']
+                    
+                    # 🎯 记录实际使用的代理配置
+                    actual_http_proxy = httpx_proxy_config.get('http://', 'None')
+                    actual_https_proxy = httpx_proxy_config.get('https://', 'None')
+                    verbose_proxy_logger.info(f"🌐 [MULTI-PROXY] Sync HTTP Client | Provider: {custom_llm_provider} | Proxy Config: {httpx_proxy_config}")
+                    
+                    # 🔧 直接创建有代理的httpx客户端
+                    import httpx
+                    if httpx_proxy_config:
+                        verbose_proxy_logger.info(f"🔧 Creating sync httpx client with proxy: {httpx_proxy_config}")
+                        proxy_client = httpx.Client(proxies=httpx_proxy_config, timeout=timeout)
+                    else:
+                        verbose_proxy_logger.warning(f"⚠️ No proxy config provided, creating client without proxy")
+                        proxy_client = httpx.Client(timeout=timeout)
+                    
+                    try:
+                        verbose_proxy_logger.info(f"📤 Sending sync request to {api_base} via proxy")
+                        
+                        # For non-streaming requests, use regular post
+                        response = proxy_client.post(
+                            url=api_base,
+                            headers=headers,
+                            content=(
+                                signed_json_body
+                                if signed_json_body is not None
+                                else json.dumps(data)
+                            ),
+                            timeout=timeout,
+                        )
+                        # 验证响应状态 - 这里如果代理不通会抛出异常
+                        response.raise_for_status()
+                        
+                        # 🎯 记录实际成功的代理（现在在状态检查之后）
+                        verbose_proxy_logger.info(f"✅ [VPN SUCCESS SYNC] Provider: {custom_llm_provider} | HTTP Proxy: {actual_http_proxy} | HTTPS Proxy: {actual_https_proxy}")
+                        print(f"✅ [VPN SUCCESS SYNC] Provider: {custom_llm_provider} | HTTP: {actual_http_proxy} | HTTPS: {actual_https_proxy}")
+                        return response
+                        
+                    except Exception as e:
+                        error_msg = str(e).lower()
+                        if any(conn_error in error_msg for conn_error in [
+                            "connection", "timeout", "network", "unreachable", 
+                            "refused", "reset", "broken", "failed to establish",
+                            "proxy", "tunnel"
+                        ]):
+                            # 🎯 记录实际失败的代理
+                            verbose_proxy_logger.warning(f"❌ [VPN FAILED SYNC] Provider: {custom_llm_provider} | HTTP Proxy: {actual_http_proxy} | HTTPS Proxy: {actual_https_proxy} | Error: {str(e)[:100]}")
+                            print(f"❌ [VPN FAILED SYNC] Provider: {custom_llm_provider} | HTTP: {actual_http_proxy} | HTTPS: {actual_https_proxy}")
+                            raise  # Re-raise to trigger retry with next proxy
+                        else:
+                            verbose_proxy_logger.error(f"❌ Non-connection error with sync proxy {httpx_proxy_config}: {e}")
+                            raise  # Re-raise non-connection errors
+                    finally:
+                        proxy_client.close()
+                
+                # Execute with multi-proxy retry (sync version)
+                response = multi_proxy_handler.execute_with_proxy_retry_sync(
+                    func=make_request_with_proxy,
+                    custom_llm_provider=custom_llm_provider,
+                    proxy_config=multi_proxy_config
+                )
+                
+                if response is not None:
+                    return response
+            else:
+                verbose_proxy_logger.info(f"📝 No multi-proxy configuration found for {custom_llm_provider}")
+                    
+        except Exception as e:
+            verbose_proxy_logger.error(f"❌ Sync multi-proxy request failed: {e}")
+            verbose_proxy_logger.warning(f"🔄 [PROXY FALLBACK] All proxy configurations failed for {custom_llm_provider}, falling back to direct connection")
+            print(f"🔄 [PROXY FALLBACK] Provider: {custom_llm_provider} | Reason: All proxies failed | Action: Using direct connection")
+            # Fall through to regular request
+        
+        # Regular single-proxy or no-proxy handling
+        verbose_proxy_logger.info(f"🌐 [DIRECT CONNECTION] Provider: {custom_llm_provider} | Using direct connection (no VPN)")
+        print(f"🌐 [DIRECT CONNECTION] Provider: {custom_llm_provider} | No VPN - using direct connection")
+        
+        for i in range(max(max_retry_on_unprocessable_entity_error, 1)):
+            try:
+                response = sync_httpx_client.post(
+                    url=api_base,
+                    headers=headers,
+                    data=(
+                        signed_json_body
+                        if signed_json_body is not None
+                        else json.dumps(data)
+                    ),
+                    timeout=timeout,
+                    stream=stream,
+                    logging_obj=logging_obj,
+                )
+                verbose_proxy_logger.info(f"✅ [DIRECT SUCCESS] Provider: {custom_llm_provider} | Direct connection successful")
+                print(f"✅ [DIRECT SUCCESS] Provider: {custom_llm_provider} | Direct connection successful")
+                break
+            except httpx.HTTPStatusError as e:
+                hit_max_retry = i + 1 == max_retry_on_unprocessable_entity_error
+                should_retry = provider_config.should_retry_llm_api_inside_llm_translation_on_http_error(
+                    e=e, litellm_params=litellm_params
+                )
+                if should_retry and not hit_max_retry:
+                    data = (
+                        provider_config.transform_request_on_unprocessable_entity_error(
+                            e=e, request_data=data
+                        )
+                    )
+                    continue
+                else:
+                    raise self._handle_error(e=e, provider_config=provider_config)
+            except Exception as e:
+                verbose_proxy_logger.error(f"❌ [DIRECT FAILED] Provider: {custom_llm_provider} | Direct connection failed: {str(e)[:100]}...")
+                print(f"❌ [DIRECT FAILED] Provider: {custom_llm_provider} | Direct connection failed: {str(e)[:100]}...")
+                raise self._handle_error(e=e, provider_config=provider_config)
+
+        if response is None:
+            raise provider_config.get_error_class(
+                error_message="No response from the API",
+                status_code=422,  # don't retry on this error
+                headers={},
+            )
+
+        return response
 
     def make_sync_call(
         self,

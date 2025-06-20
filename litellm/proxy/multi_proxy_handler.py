@@ -82,11 +82,15 @@ class MultiProxyHandler:
             
             try:
                 proxy_url = proxy_config.get('http') or proxy_config.get('https', 'Unknown')
-                verbose_proxy_logger.info(f"🎯 Attempt {attempt + 1}/{retry_count} for {custom_llm_provider} using proxy: {proxy_url}")
+                verbose_proxy_logger.info(f"🔗 [VPN ATTEMPT] Provider: {custom_llm_provider} | Attempt: {attempt + 1}/{retry_count} | Selected Proxy: {proxy_url}")
+                print(f"🔗 [VPN ATTEMPT] Provider: {custom_llm_provider} | Attempt: {attempt + 1}/{retry_count} | Selected Proxy: {proxy_url}")
                 
-                # Execute request with selected proxy
+                # Execute request with selected proxy - success/failure logging happens in HTTP handler
                 response = await func(proxy_config)
-                verbose_proxy_logger.info(f"✅ Multi-proxy request successful for {custom_llm_provider} using proxy: {proxy_url}")
+                
+                # 🎯 请求成功，但具体使用的代理由HTTP handler记录
+                verbose_proxy_logger.info(f"✅ [VPN REQUEST SUCCESS] Provider: {custom_llm_provider} | Attempt: {attempt + 1}/{retry_count}")
+                print(f"✅ [VPN REQUEST SUCCESS] Provider: {custom_llm_provider} | Attempt: {attempt + 1}/{retry_count}")
                 return response
                 
             except Exception as e:
@@ -103,23 +107,28 @@ class MultiProxyHandler:
                     "connection reset", "connection aborted", "proxy error",
                     "502 bad gateway", "503 service unavailable", "504 gateway timeout"
                 ]):
-                    verbose_proxy_logger.warning(f"🔌 Proxy connection failed for {custom_llm_provider} using proxy: {proxy_url}")
-                    verbose_proxy_logger.debug(f"   Error details: {e}")
+                    # 🎯 代理连接失败日志
+                    verbose_proxy_logger.warning(f"❌ [VPN ATTEMPT FAILED] Provider: {custom_llm_provider} | Selected Proxy: {proxy_url} | Attempt: {attempt + 1}/{retry_count}")
+                    print(f"❌ [VPN ATTEMPT FAILED] Provider: {custom_llm_provider} | Selected Proxy: {proxy_url} | Attempt: {attempt + 1}/{retry_count} | Error: {str(e)[:100]}...")
+                    verbose_proxy_logger.debug(f"   [VPN ATTEMPT FAILED] Detailed Error: {e}")
                     
                     # Mark this proxy as failed
                     await self._mark_proxy_as_failed(custom_llm_provider, proxy_url)
                     
                     if attempt < retry_count - 1:
-                        verbose_proxy_logger.info(f"⏳ Retrying with different proxy in {retry_delay} seconds... ({attempt + 2}/{retry_count})")
+                        verbose_proxy_logger.info(f"🔄 [VPN RETRY] Switching to next proxy in {retry_delay} seconds... ({attempt + 2}/{retry_count})")
+                        print(f"🔄 [VPN RETRY] Provider: {custom_llm_provider} | Next attempt in {retry_delay}s | Remaining attempts: {retry_count - attempt - 1}")
                         await asyncio.sleep(retry_delay)
                     continue
                 else:
                     # Non-connection error, don't retry
-                    verbose_proxy_logger.error(f"❌ Non-connection error for {custom_llm_provider}: {e}")
+                    verbose_proxy_logger.error(f"❌ [VPN ERROR] Non-connection error for {custom_llm_provider}: {e}")
+                    print(f"❌ [VPN ERROR] Provider: {custom_llm_provider} | Non-connection error: {str(e)[:100]}...")
                     raise e
         
-        # All attempts failed
-        verbose_proxy_logger.error(f"💀 All proxy attempts failed for {custom_llm_provider}")
+        # All attempts failed - this triggers fallback to no-proxy
+        verbose_proxy_logger.error(f"💀 [VPN EXHAUSTED] All proxy attempts failed for {custom_llm_provider} - falling back to direct connection")
+        print(f"💀 [VPN EXHAUSTED] Provider: {custom_llm_provider} | All {retry_count} proxies failed | Fallback: Direct connection")
         if last_exception:
             raise last_exception
         else:
@@ -148,12 +157,27 @@ class MultiProxyHandler:
         """
         verbose_proxy_logger.info(f"🔄 Starting sync multi-proxy retry for {custom_llm_provider}")
         
+        # 🔧 修复asyncio事件循环问题 - 使用已有的配置而不是重新加载
         # Get fresh configuration from database (sync version)
-        multi_proxy_config = asyncio.run(
-            global_proxy_config.get_multi_proxy_config_dynamic(
+        multi_proxy_config = None
+        try:
+            # 尝试获取当前事件循环
+            import asyncio
+            loop = asyncio.get_running_loop()
+            # 如果有运行中的事件循环，使用同步方法
+            verbose_proxy_logger.debug(f"Running event loop detected, using sync proxy config method")
+            multi_proxy_config = global_proxy_config.get_multi_proxy_config(
                 custom_llm_provider=custom_llm_provider
             )
-        )
+        except RuntimeError:
+            # 没有运行中的事件循环，可以使用 asyncio.run
+            verbose_proxy_logger.debug(f"No running event loop, using asyncio.run")
+            import asyncio
+            multi_proxy_config = asyncio.run(
+                global_proxy_config.get_multi_proxy_config_dynamic(
+                    custom_llm_provider=custom_llm_provider
+                )
+            )
         
         if not multi_proxy_config:
             verbose_proxy_logger.warning(f"⚠️  No multi-proxy configuration found for {custom_llm_provider}")
@@ -187,11 +211,15 @@ class MultiProxyHandler:
             
             try:
                 proxy_url = proxy_config.get('http') or proxy_config.get('https', 'Unknown')
-                verbose_proxy_logger.info(f"🎯 Sync attempt {attempt + 1}/{retry_count} for {custom_llm_provider} using proxy: {proxy_url}")
+                verbose_proxy_logger.info(f"🔗 [VPN ATTEMPT SYNC] Provider: {custom_llm_provider} | Attempt: {attempt + 1}/{retry_count} | Selected Proxy: {proxy_url}")
+                print(f"🔗 [VPN ATTEMPT SYNC] Provider: {custom_llm_provider} | Attempt: {attempt + 1}/{retry_count} | Selected Proxy: {proxy_url}")
                 
-                # Execute request with selected proxy
+                # Execute request with selected proxy - success/failure logging happens in HTTP handler
                 response = func(proxy_config)
-                verbose_proxy_logger.info(f"✅ Sync multi-proxy request successful for {custom_llm_provider} using proxy: {proxy_url}")
+                
+                # 🎯 请求成功，但具体使用的代理由HTTP handler记录
+                verbose_proxy_logger.info(f"✅ [VPN REQUEST SUCCESS SYNC] Provider: {custom_llm_provider} | Attempt: {attempt + 1}/{retry_count}")
+                print(f"✅ [VPN REQUEST SUCCESS SYNC] Provider: {custom_llm_provider} | Attempt: {attempt + 1}/{retry_count}")
                 return response
                 
             except Exception as e:
@@ -208,23 +236,28 @@ class MultiProxyHandler:
                     "connection reset", "connection aborted", "proxy error",
                     "502 bad gateway", "503 service unavailable", "504 gateway timeout"
                 ]):
-                    verbose_proxy_logger.warning(f"🔌 Sync proxy connection failed for {custom_llm_provider} using proxy: {proxy_url}")
-                    verbose_proxy_logger.debug(f"   Error details: {e}")
+                    # 🎯 代理连接失败日志
+                    verbose_proxy_logger.warning(f"❌ [VPN ATTEMPT FAILED SYNC] Provider: {custom_llm_provider} | Selected Proxy: {proxy_url} | Attempt: {attempt + 1}/{retry_count}")
+                    print(f"❌ [VPN ATTEMPT FAILED SYNC] Provider: {custom_llm_provider} | Selected Proxy: {proxy_url} | Attempt: {attempt + 1}/{retry_count} | Error: {str(e)[:100]}...")
+                    verbose_proxy_logger.debug(f"   [VPN ATTEMPT FAILED SYNC] Detailed Error: {e}")
                     
                     # Mark this proxy as failed (sync version)
                     self._mark_proxy_as_failed_sync(custom_llm_provider, proxy_url)
                     
                     if attempt < retry_count - 1:
-                        verbose_proxy_logger.info(f"⏳ Retrying with different proxy in {retry_delay} seconds... ({attempt + 2}/{retry_count})")
+                        verbose_proxy_logger.info(f"🔄 [VPN RETRY SYNC] Switching to next proxy in {retry_delay} seconds... ({attempt + 2}/{retry_count})")
+                        print(f"🔄 [VPN RETRY SYNC] Provider: {custom_llm_provider} | Next attempt in {retry_delay}s | Remaining attempts: {retry_count - attempt - 1}")
                         time.sleep(retry_delay)
                     continue
                 else:
                     # Non-connection error, don't retry
-                    verbose_proxy_logger.error(f"❌ Non-connection error for {custom_llm_provider}: {e}")
+                    verbose_proxy_logger.error(f"❌ [VPN ERROR SYNC] Non-connection error for {custom_llm_provider}: {e}")
+                    print(f"❌ [VPN ERROR SYNC] Provider: {custom_llm_provider} | Non-connection error: {str(e)[:100]}...")
                     raise e
         
-        # All attempts failed
-        verbose_proxy_logger.error(f"💀 All sync proxy attempts failed for {custom_llm_provider}")
+        # All attempts failed - this triggers fallback to no-proxy
+        verbose_proxy_logger.error(f"💀 [VPN EXHAUSTED SYNC] All sync proxy attempts failed for {custom_llm_provider} - falling back to direct connection")
+        print(f"💀 [VPN EXHAUSTED SYNC] Provider: {custom_llm_provider} | All {retry_count} proxies failed | Fallback: Direct connection")
         if last_exception:
             raise last_exception
         else:

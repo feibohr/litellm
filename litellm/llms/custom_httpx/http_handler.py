@@ -917,10 +917,10 @@ def get_async_httpx_client(
     if proxy_config:
         proxy_type = "MULTI-PROXY" if multi_proxy_config else "PROXY"
         verbose_proxy_logger.info(f"🌐 [{proxy_type}] Creating Async HTTP client for {custom_llm_provider or llm_provider} with proxy config: {proxy_config}")
-        print(f"🌐 [{proxy_type}] Async HTTP Client | Provider: {custom_llm_provider or llm_provider} | Proxy Config: {proxy_config}")
+        verbose_proxy_logger.debug(f"🌐 [{proxy_type}] Async HTTP Client | Provider: {custom_llm_provider or llm_provider} | Proxy Config: {proxy_config}")
     else:
         verbose_proxy_logger.debug(f"🌐 [PROXY] Creating Async HTTP client for {custom_llm_provider or llm_provider} without proxy")
-        print(f"🌐 [PROXY] Async HTTP Client | Provider: {custom_llm_provider or llm_provider} | No proxy configured")
+        verbose_proxy_logger.debug(f"🌐 [PROXY] Async HTTP Client | Provider: {custom_llm_provider or llm_provider} | No proxy configured")
 
     # Create params dict with proxy config if available
     client_params = {}
@@ -1015,10 +1015,10 @@ def _get_httpx_client(params: Optional[dict] = None, custom_llm_provider: Option
     if proxy_config:
         proxy_type = "MULTI-PROXY" if multi_proxy_config else "PROXY"
         verbose_proxy_logger.info(f"🌐 [{proxy_type}] Creating HTTP client for {custom_llm_provider or 'unknown'} with proxy config: {proxy_config}")
-        print(f"🌐 [{proxy_type}] HTTP Client | Provider: {custom_llm_provider or 'unknown'} | Proxy Config: {proxy_config}")
+        verbose_proxy_logger.debug(f"🌐 [{proxy_type}] HTTP Client | Provider: {custom_llm_provider or 'unknown'} | Proxy Config: {proxy_config}")
     else:
         verbose_proxy_logger.debug(f"🌐 [PROXY] Creating HTTP client for {custom_llm_provider or 'unknown'} without proxy")
-        print(f"🌐 [PROXY] HTTP Client | Provider: {custom_llm_provider or 'unknown'} | No proxy configured")
+        verbose_proxy_logger.debug(f"🌐 [PROXY] HTTP Client | Provider: {custom_llm_provider or 'unknown'} | No proxy configured")
 
     # Create params dict with proxy config if available
     client_params = {}
