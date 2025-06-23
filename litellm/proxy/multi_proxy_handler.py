@@ -57,8 +57,9 @@ class MultiProxyHandler:
             raise Exception(f"No multi-proxy configuration found for {custom_llm_provider}")
         
         proxies = multi_proxy_config.get("proxies", [])
-        retry_count = multi_proxy_config.get("retry_count", 3)
-        retry_delay = multi_proxy_config.get("retry_delay", 1.0)
+        # 🔧 高并发优化：减少重试次数，避免连接池耗尽
+        retry_count = min(multi_proxy_config.get("retry_count", 3), len(proxies))  # 重试次数不超过代理数量
+        retry_delay = max(multi_proxy_config.get("retry_delay", 1.0), 0.1)  # 最小延迟0.1秒
         
         verbose_proxy_logger.info(f"📋 Multi-proxy config: {len(proxies)} proxies, {retry_count} retries, {retry_delay}s delay")
         
@@ -105,7 +106,8 @@ class MultiProxyHandler:
                     "streamclosed", "stream closed", "stream has been closed",
                     "attempted to read or stream content", "connection lost",
                     "connection reset", "connection aborted", "proxy error",
-                    "502 bad gateway", "503 service unavailable", "504 gateway timeout"
+                    "502 bad gateway", "503 service unavailable", "504 gateway timeout",
+                    "pool", "exhausted", "limit"  # 🔧 添加连接池相关错误
                 ]):
                     # 🎯 代理连接失败日志
                     verbose_proxy_logger.warning(f"❌ [VPN ATTEMPT FAILED] Provider: {custom_llm_provider} | Selected Proxy: {proxy_url} | Attempt: {attempt + 1}/{retry_count}")
@@ -116,9 +118,11 @@ class MultiProxyHandler:
                     await self._mark_proxy_as_failed(custom_llm_provider, proxy_url)
                     
                     if attempt < retry_count - 1:
-                        verbose_proxy_logger.info(f"🔄 [VPN RETRY] Switching to next proxy in {retry_delay} seconds... ({attempt + 2}/{retry_count})")
-                        print(f"🔄 [VPN RETRY] Provider: {custom_llm_provider} | Next attempt in {retry_delay}s | Remaining attempts: {retry_count - attempt - 1}")
-                        await asyncio.sleep(retry_delay)
+                        # 🔧 高并发优化：动态调整延迟时间
+                        dynamic_delay = retry_delay * (1 + attempt * 0.5)  # 递增延迟
+                        verbose_proxy_logger.info(f"🔄 [VPN RETRY] Switching to next proxy in {dynamic_delay:.1f} seconds... ({attempt + 2}/{retry_count})")
+                        print(f"🔄 [VPN RETRY] Provider: {custom_llm_provider} | Next attempt in {dynamic_delay:.1f}s | Remaining attempts: {retry_count - attempt - 1}")
+                        await asyncio.sleep(dynamic_delay)
                     continue
                 else:
                     # Non-connection error, don't retry
@@ -184,8 +188,9 @@ class MultiProxyHandler:
             raise Exception(f"No multi-proxy configuration found for {custom_llm_provider}")
         
         proxies = multi_proxy_config.get("proxies", [])
-        retry_count = multi_proxy_config.get("retry_count", 3)
-        retry_delay = multi_proxy_config.get("retry_delay", 1.0)
+        # 🔧 高并发优化：减少重试次数，避免连接池耗尽
+        retry_count = min(multi_proxy_config.get("retry_count", 3), len(proxies))  # 重试次数不超过代理数量
+        retry_delay = max(multi_proxy_config.get("retry_delay", 1.0), 0.1)  # 最小延迟0.1秒
         
         verbose_proxy_logger.info(f"📋 Sync multi-proxy config: {len(proxies)} proxies, {retry_count} retries, {retry_delay}s delay")
         
@@ -234,7 +239,8 @@ class MultiProxyHandler:
                     "streamclosed", "stream closed", "stream has been closed",
                     "attempted to read or stream content", "connection lost",
                     "connection reset", "connection aborted", "proxy error",
-                    "502 bad gateway", "503 service unavailable", "504 gateway timeout"
+                    "502 bad gateway", "503 service unavailable", "504 gateway timeout",
+                    "pool", "exhausted", "limit"  # 🔧 添加连接池相关错误
                 ]):
                     # 🎯 代理连接失败日志
                     verbose_proxy_logger.warning(f"❌ [VPN ATTEMPT FAILED SYNC] Provider: {custom_llm_provider} | Selected Proxy: {proxy_url} | Attempt: {attempt + 1}/{retry_count}")
@@ -245,9 +251,11 @@ class MultiProxyHandler:
                     self._mark_proxy_as_failed_sync(custom_llm_provider, proxy_url)
                     
                     if attempt < retry_count - 1:
-                        verbose_proxy_logger.info(f"🔄 [VPN RETRY SYNC] Switching to next proxy in {retry_delay} seconds... ({attempt + 2}/{retry_count})")
-                        print(f"🔄 [VPN RETRY SYNC] Provider: {custom_llm_provider} | Next attempt in {retry_delay}s | Remaining attempts: {retry_count - attempt - 1}")
-                        time.sleep(retry_delay)
+                        # 🔧 高并发优化：动态调整延迟时间
+                        dynamic_delay = retry_delay * (1 + attempt * 0.5)  # 递增延迟
+                        verbose_proxy_logger.info(f"🔄 [VPN RETRY SYNC] Switching to next proxy in {dynamic_delay:.1f} seconds... ({attempt + 2}/{retry_count})")
+                        print(f"🔄 [VPN RETRY SYNC] Provider: {custom_llm_provider} | Next attempt in {dynamic_delay:.1f}s | Remaining attempts: {retry_count - attempt - 1}")
+                        time.sleep(dynamic_delay)
                     continue
                 else:
                     # Non-connection error, don't retry
