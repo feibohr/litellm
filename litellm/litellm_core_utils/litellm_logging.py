@@ -736,7 +736,7 @@ class Logging(LiteLLMLoggingBaseClass):
             # User Logging -> if you pass in a custom logging function
             self._print_llm_call_debugging_log(
                 api_base=additional_args.get("api_base", ""),
-                headers=additional_args.get("headers", {}),
+                headers=additional_args.get("headers") or {},  # 🔧 防护检查：确保 headers 不为 None
                 additional_args=additional_args,
             )
             # log raw request to provider (like LangFuse) -- if opted in.
@@ -756,7 +756,7 @@ class Logging(LiteLLMLoggingBaseClass):
                     else:
                         curl_command = self._get_request_curl_command(
                             api_base=additional_args.get("api_base", ""),
-                            headers=additional_args.get("headers", {}),
+                            headers=additional_args.get("headers") or {},  # 🔧 防护检查：确保 headers 不为 None
                             additional_args=additional_args,
                             data=additional_args.get("complete_input_dict", {}),
                         )
@@ -773,7 +773,7 @@ class Logging(LiteLLMLoggingBaseClass):
                                 additional_args.get("complete_input_dict", {})
                             ),
                             raw_request_headers=self._get_masked_headers(
-                                additional_args.get("headers", {}) or {},
+                                additional_args.get("headers") or {},  # 🔧 防护检查：确保 headers 不为 None
                                 ignore_sensitive_headers=True,
                             ),
                             error=None,
@@ -943,6 +943,9 @@ class Logging(LiteLLMLoggingBaseClass):
 
         Masks the headers of the request sent from LiteLLM
         """
+        # 🔧 防护检查：如果 headers 为 None，使用空字典
+        if headers is None:
+            headers = {}
         return _get_masked_values(
             headers, ignore_sensitive_values=ignore_sensitive_headers
         )
@@ -2633,6 +2636,10 @@ def _get_masked_values(
         masked_length: Optional length for the masked portion (number of *). If set, will use exactly this many *
                      regardless of original string length. The total length will be unmasked_length + masked_length.
     """
+    # 🔧 防护检查：如果 sensitive_object 为 None 或不是字典，返回空字典
+    if sensitive_object is None or not isinstance(sensitive_object, dict):
+        return {}
+        
     sensitive_keywords = [
         "authorization",
         "token",
