@@ -406,102 +406,78 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
         data: dict,
         timeout: Union[float, httpx.Timeout],
         logging_obj: LiteLLMLoggingObj,
+        custom_llm_provider: Optional[str] = None,
     ) -> Tuple[dict, BaseModel]:
         """
         Helper to:
         - call chat.completions.create.with_raw_response when litellm.return_response_headers is True
         - call chat.completions.create by default
-        - Support multi-proxy retry for connection failures
         """
+        import time
         start_time = time.time()
         
-        # Check if this is a multi-proxy configuration
+        # Use universal proxy handler for all providers
         try:
-            from litellm.proxy.proxy_config import global_proxy_config
-            from litellm.proxy.multi_proxy_handler import multi_proxy_handler
+            from litellm.proxy.universal_proxy_handler import apply_universal_proxy
             
-            # Get custom_llm_provider from client's base_url
-            custom_llm_provider = None
-            if hasattr(openai_aclient, "_client") and hasattr(openai_aclient._client, "_base_url"):
-                base_url = str(openai_aclient._client._base_url)
-                if "openrouter.ai" in base_url:
-                    custom_llm_provider = "openrouter"
-                elif "azure" in base_url:
-                    custom_llm_provider = "azure"
-                # Add more provider detection as needed
+            verbose_proxy_logger.debug(f"🔍 Using universal proxy handler for provider: {custom_llm_provider}")
             
-            # Log the provider detection
-            if custom_llm_provider:
-                verbose_proxy_logger.info(f"🔍 Detected provider: {custom_llm_provider} from base_url: {base_url}")
-            
-            # Check if multi-proxy configuration exists
-            multi_proxy_config = global_proxy_config.get_multi_proxy_config(
-                custom_llm_provider=custom_llm_provider
-            )
-            
-            if multi_proxy_config and custom_llm_provider:
-                verbose_proxy_logger.info(
-                    f"🔄 Multi-proxy configuration detected for {custom_llm_provider}: "
-                    f"{len(multi_proxy_config.get('proxies', []))} proxies available, "
-                    f"retry_count={multi_proxy_config.get('retry_count', 3)}, "
-                    f"retry_delay={multi_proxy_config.get('retry_delay', 1.0)}s"
-                )
-                
-                # Use multi-proxy retry mechanism
-                async def make_request_with_retry():
-                    return await multi_proxy_handler.execute_with_proxy_retry(
-                        func=self._make_single_openai_request,
-                        custom_llm_provider=custom_llm_provider,
-                        openai_aclient=openai_aclient,
-                        data=data,
-                        timeout=timeout
+            # Define the actual request function
+            async def make_request(openai_aclient, data, timeout):
+                if litellm.return_response_headers:
+                    raw_response = await openai_aclient.chat.completions.with_raw_response.create(
+                        **data, timeout=timeout
                     )
-                
-                headers, response = await make_request_with_retry()
-                end_time = time.time()
-                verbose_proxy_logger.info(
-                    f"✅ Multi-proxy request completed for {custom_llm_provider} in {end_time - start_time:.2f}s"
-                )
-                return headers, response
-            else:
-                if custom_llm_provider:
-                    verbose_proxy_logger.info(f"📝 No multi-proxy configuration found for {custom_llm_provider}, using standard request")
+                    if hasattr(raw_response, "headers"):
+                        headers = dict(raw_response.headers)
+                    else:
+                        headers = {}
+                    response = raw_response.parse()
+                    return headers, response
                 else:
-                    verbose_proxy_logger.debug("📝 No provider detected, using standard request")
-                
-        except ImportError:
-            # Multi-proxy handler not available, fall back to regular request
-            verbose_proxy_logger.warning("⚠️  Multi-proxy handler not available, falling back to regular request")
-        except Exception as e:
-            # Log but don't fail on multi-proxy setup errors
-            verbose_proxy_logger.error(f"❌ Multi-proxy setup error: {e}")
-        
-        # Regular single request
-        try:
-            verbose_proxy_logger.info("🌐 Executing standard OpenAI request (no multi-proxy)")
-            raw_response = (
-                await openai_aclient.chat.completions.with_raw_response.create(
-                    **data, timeout=timeout
-                )
+                    response = await openai_aclient.chat.completions.create(**data, timeout=timeout)
+                    return {}, response
+            
+            # Apply universal proxy
+            headers, response = await apply_universal_proxy(
+                func=make_request,
+                custom_llm_provider=custom_llm_provider,
+                openai_aclient=openai_aclient,
+                data=data,
+                timeout=timeout
             )
+            
             end_time = time.time()
-            verbose_proxy_logger.info(f"✅ Standard request completed in {end_time - start_time:.2f}s")
-
+            verbose_proxy_logger.info(
+                f"✅ Universal proxy request completed for {custom_llm_provider} in {end_time - start_time:.2f}s"
+            )
+            return headers, response
+            
+        except ImportError:
+            # Fallback to original implementation if universal proxy handler not available
+            verbose_proxy_logger.warning("⚠️ Universal proxy handler not available, using original implementation")
+        except Exception as e:
+            # Handle the case where no proxy config is found gracefully
+            if "No multi-proxy configuration found" in str(e):
+                verbose_proxy_logger.debug(f"ℹ️ No proxy config found for {custom_llm_provider}, using direct connection")
+            else:
+                verbose_proxy_logger.warning(f"⚠️ Universal proxy handler failed: {e}, using direct connection")
+        
+        # Fallback to direct connection (without proxy)
+        verbose_proxy_logger.debug(f"📤 Making direct request without proxy for {custom_llm_provider}")
+        if litellm.return_response_headers:
+            raw_response = await openai_aclient.chat.completions.with_raw_response.create(
+                **data, timeout=timeout
+            )
             if hasattr(raw_response, "headers"):
                 headers = dict(raw_response.headers)
             else:
                 headers = {}
             response = raw_response.parse()
             return headers, response
-        except openai.APITimeoutError as e:
-            end_time = time.time()
-            time_delta = round(end_time - start_time, 2)
-            e.message += f" - timeout value={timeout}, time taken={time_delta} seconds"
-            verbose_proxy_logger.error(f"⏰ Request timeout after {time_delta}s")
-            raise e
-        except Exception as e:
-            verbose_proxy_logger.error(f"❌ Standard request failed: {e}")
-            raise e
+        else:
+            response = await openai_aclient.chat.completions.create(**data, timeout=timeout)
+            return {}, response
     
     async def _make_single_openai_request(
         self,
@@ -560,16 +536,11 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                 )
                 raise e
             finally:
-                # Clean up the proxy client
-                try:
-                    await httpx_client.aclose()
-                    await proxy_openai_client.close()
-                    verbose_proxy_logger.debug(f"🧹 Cleaned up proxy client for {proxy_config.get('http', 'N/A')}")
-                except Exception as cleanup_error:
-                    verbose_proxy_logger.warning(f"⚠️  Failed to cleanup proxy client: {cleanup_error}")
+                # Ensure httpx client is properly closed
+                await httpx_client.aclose()
         else:
-            # Use the original client
-            verbose_proxy_logger.info("📤 Sending request via original client (no specific proxy)")
+            # No proxy config, use original client
+            verbose_proxy_logger.info(f"📤 Sending request without proxy")
             raw_response = await openai_aclient.chat.completions.with_raw_response.create(
                 **data, timeout=timeout
             )
@@ -588,33 +559,69 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
         data: dict,
         timeout: Union[float, httpx.Timeout],
         logging_obj: LiteLLMLoggingObj,
+        custom_llm_provider: Optional[str] = None,
     ) -> Tuple[dict, BaseModel]:
         """
         Helper to:
         - call chat.completions.create.with_raw_response when litellm.return_response_headers is True
         - call chat.completions.create by default
         """
-        raw_response = None
-        try:
-            raw_response = openai_client.chat.completions.with_raw_response.create(
-                **data, timeout=timeout
-            )
-
-            if hasattr(raw_response, "headers"):
-                headers = dict(raw_response.headers)
-            else:
-                headers = {}
-            response = raw_response.parse()
-            return headers, response
-        except Exception as e:
-            if raw_response is not None:
-                raise Exception(
-                    "error - {}, Received response - {}, Type of response - {}".format(
-                        e, raw_response, type(raw_response)
-                    )
+        # For sync version, we'll handle proxy configuration differently
+        # since we can't call async apply_universal_proxy from sync context
+        proxy_config = None
+        if custom_llm_provider:
+            try:
+                from litellm.proxy.proxy_config import get_multi_proxy_config_dynamic
+                proxy_config = get_multi_proxy_config_dynamic(
+                    custom_llm_provider=custom_llm_provider
                 )
+                verbose_proxy_logger.debug(f"🔍 Sync proxy config for {custom_llm_provider}: {proxy_config}")
+            except ImportError:
+                verbose_proxy_logger.debug(f"⚠️ Proxy config module not available")
+            except Exception as e:
+                # Handle the case where no proxy config is found gracefully
+                if "No multi-proxy configuration found" in str(e):
+                    verbose_proxy_logger.debug(f"ℹ️ No proxy config found for {custom_llm_provider}, using direct connection")
+                else:
+                    verbose_proxy_logger.debug(f"⚠️ Could not get proxy config for {custom_llm_provider}: {e}")
+        
+        # Apply proxy config if available
+        if proxy_config and proxy_config.get("proxies"):
+            try:
+                # Create a new client with proxy configuration
+                import httpx
+                proxies = proxy_config["proxies"][0] if proxy_config["proxies"] else {}
+                
+                if proxies:
+                    # Create httpx client with proxy
+                    http_client = httpx.Client(proxies=proxies)
+                    # Create new OpenAI client with proxy
+                    openai_client = OpenAI(
+                        api_key=openai_client.api_key,
+                        base_url=str(openai_client.base_url),
+                        http_client=http_client,
+                        timeout=timeout,
+                        max_retries=openai_client.max_retries,
+                        organization=openai_client.organization,
+                    )
+                    verbose_proxy_logger.debug(f"✅ Applied sync proxy config for {custom_llm_provider}")
+            except Exception as e:
+                verbose_proxy_logger.debug(f"⚠️ Sync proxy setup failed, using original client: {e}")
+        
+        # Make the request with the (possibly proxied) client
+        try:
+            if litellm.return_response_headers is True:
+                raw_response = openai_client.chat.completions.with_raw_response.create(
+                    **data, timeout=timeout
+                )
+                headers = dict(raw_response.headers)
+                response = raw_response.parse()
+                return headers, response
             else:
-                raise e
+                response = openai_client.chat.completions.create(**data, timeout=timeout)
+                return {}, response
+        except Exception as e:
+            raise e
 
     def mock_streaming(
         self,
@@ -704,23 +711,29 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                     max_retries = inference_params.pop("max_retries", 2)
                     if acompletion is True:
                         if stream is True and fake_stream is False:
-                            return self.async_streaming(
-                                logging_obj=logging_obj,
-                                headers=headers,
+                            # Transform request data for async streaming
+                            data = provider_config.transform_request(
+                                model=model,
                                 messages=messages,
                                 optional_params=inference_params,
                                 litellm_params=litellm_params,
-                                provider_config=provider_config,
+                                headers=headers or {},
+                            )
+                            data["stream"] = True
+                            data.update(
+                                self.get_stream_options(stream_options=stream_options, api_base=api_base)
+                            )
+                            return self.async_streaming(
+                                logging_obj=logging_obj,
+                                api_key=api_key,
+                                data=data,
                                 model=model,
                                 api_base=api_base,
-                                api_key=api_key,
                                 api_version=api_version,
                                 timeout=timeout,
-                                client=client,
                                 max_retries=max_retries,
                                 organization=organization,
-                                drop_params=drop_params,
-                                stream_options=stream_options,
+                                custom_llm_provider=custom_llm_provider,
                             )
                         else:
                             return self.acompletion(
@@ -764,6 +777,7 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                             max_retries=max_retries,
                             organization=organization,
                             stream_options=stream_options,
+                            custom_llm_provider=custom_llm_provider,
                         )
                     else:
                         if not isinstance(max_retries, int):
@@ -801,6 +815,7 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                             data=data,
                             timeout=timeout,
                             logging_obj=logging_obj,
+                            custom_llm_provider=custom_llm_provider,
                         )
 
                         logging_obj.model_call_details["response_headers"] = headers
@@ -949,6 +964,7 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
                     data=data,
                     timeout=timeout,
                     logging_obj=logging_obj,
+                    custom_llm_provider="openai",  # 修复：传递正确的provider名称而不是None
                 )
                 stringified_response = response.model_dump()
 
@@ -1012,6 +1028,7 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
         max_retries=None,
         headers=None,
         stream_options: Optional[dict] = None,
+        custom_llm_provider: Optional[str] = None,
     ):
         data["stream"] = True
         data.update(
@@ -1044,6 +1061,7 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
             data=data,
             timeout=timeout,
             logging_obj=logging_obj,
+            custom_llm_provider=custom_llm_provider,
         )
 
         logging_obj.model_call_details["response_headers"] = headers
@@ -1059,122 +1077,41 @@ class OpenAIChatCompletion(BaseLLM, BaseOpenAILLM):
 
     async def async_streaming(
         self,
-        timeout: Union[float, httpx.Timeout],
-        messages: list,
-        optional_params: dict,
-        litellm_params: dict,
-        provider_config: BaseConfig,
-        model: str,
         logging_obj: LiteLLMLoggingObj,
-        api_key: Optional[str] = None,
-        api_base: Optional[str] = None,
-        api_version: Optional[str] = None,
+        api_key: str,
+        data: dict,
+        model: str,
+        api_base: str,
+        api_version: Optional[str],
+        timeout: Union[float, httpx.Timeout],
+        max_retries: Optional[int] = None,
         organization: Optional[str] = None,
-        client=None,
-        max_retries=None,
-        headers=None,
-        drop_params: Optional[bool] = None,
-        stream_options: Optional[dict] = None,
-    ):
-        response = None
-        data = provider_config.transform_request(
+        custom_llm_provider: Optional[str] = None,
+    ) -> CustomStreamWrapper:
+        openai_aclient = self._get_openai_client(
+            is_async=True,  # 修复：添加缺失的is_async参数
+            api_key=api_key,
+            api_base=api_base,
+            api_version=api_version,
+            timeout=timeout,
+            max_retries=max_retries,
+            organization=organization,
+        )
+        headers, response = await self.make_openai_chat_completion_request(
+            openai_aclient=openai_aclient,
+            data=data,
+            timeout=timeout,
+            logging_obj=logging_obj,
+            custom_llm_provider=custom_llm_provider,
+        )
+
+        streamwrapper = CustomStreamWrapper(
+            completion_stream=response,
             model=model,
-            messages=messages,
-            optional_params=optional_params,
-            litellm_params=litellm_params,
-            headers=headers or {},
+            custom_llm_provider="openai",
+            logging_obj=logging_obj,
         )
-        data["stream"] = True
-        data.update(
-            self.get_stream_options(stream_options=stream_options, api_base=api_base)
-        )
-        for _ in range(2):
-            try:
-                openai_aclient: AsyncOpenAI = self._get_openai_client(  # type: ignore
-                    is_async=True,
-                    api_key=api_key,
-                    api_base=api_base,
-                    api_version=api_version,
-                    timeout=timeout,
-                    max_retries=max_retries,
-                    organization=organization,
-                    client=client,
-                )
-                ## LOGGING
-                logging_obj.pre_call(
-                    input=data["messages"],
-                    api_key=api_key,
-                    additional_args={
-                        "headers": headers,
-                        "api_base": api_base,
-                        "acompletion": True,
-                        "complete_input_dict": data,
-                    },
-                )
-
-                headers, response = await self.make_openai_chat_completion_request(
-                    openai_aclient=openai_aclient,
-                    data=data,
-                    timeout=timeout,
-                    logging_obj=logging_obj,
-                )
-                logging_obj.model_call_details["response_headers"] = headers
-                streamwrapper = CustomStreamWrapper(
-                    completion_stream=response,
-                    model=model,
-                    custom_llm_provider="openai",
-                    logging_obj=logging_obj,
-                    stream_options=data.get("stream_options", None),
-                    _response_headers=headers,
-                )
-                return streamwrapper
-            except openai.UnprocessableEntityError as e:
-                ## check if body contains unprocessable params - related issue https://github.com/BerriAI/litellm/issues/4800
-                if litellm.drop_params is True or drop_params is True:
-                    data = drop_params_from_unprocessable_entity_error(e, data)
-                else:
-                    raise e
-            except (
-                Exception
-            ) as e:  # need to exception handle here. async exceptions don't get caught in sync functions.
-                if isinstance(e, OpenAIError):
-                    raise e
-
-                error_headers = getattr(e, "headers", None)
-                status_code = getattr(e, "status_code", 500)
-                error_response = getattr(e, "response", None)
-                exception_body = getattr(e, "body", None)
-                if error_headers is None and error_response:
-                    error_headers = getattr(error_response, "headers", None)
-                if response is not None and hasattr(response, "text"):
-                    raise OpenAIError(
-                        status_code=status_code,
-                        message=f"{str(e)}\n\nOriginal Response: {response.text}",  # type: ignore
-                        headers=error_headers,
-                        body=exception_body,
-                    )
-                else:
-                    if type(e).__name__ == "ReadTimeout":
-                        raise OpenAIError(
-                            status_code=408,
-                            message=f"{type(e).__name__}",
-                            headers=error_headers,
-                            body=exception_body,
-                        )
-                    elif hasattr(e, "status_code"):
-                        raise OpenAIError(
-                            status_code=getattr(e, "status_code", 500),
-                            message=str(e),
-                            headers=error_headers,
-                            body=exception_body,
-                        )
-                    else:
-                        raise OpenAIError(
-                            status_code=500,
-                            message=f"{str(e)}",
-                            headers=error_headers,
-                            body=exception_body,
-                        )
+        return streamwrapper
 
     def get_stream_options(
         self, stream_options: Optional[dict], api_base: Optional[str]
